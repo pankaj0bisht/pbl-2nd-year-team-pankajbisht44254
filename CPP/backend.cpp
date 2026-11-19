@@ -45,6 +45,7 @@ public:
     ParkingException(const char* msg) { copyStr(message, msg, 100); }
     const char* what() const { return message; }
 };
+
 class Vehicle {
 protected:
     char number[NAME_LEN];
