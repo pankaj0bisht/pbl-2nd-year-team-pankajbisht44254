@@ -244,3 +244,162 @@ bool UndoStack::peek(int& reservationId) const {
     reservationId = data[top];
     return true;
 }
+enum SlotState { SLOT_FREE, SLOT_RESERVED, SLOT_OCCUPIED, SLOT_EXPIRED };
+
+class ParkingSlot {
+    SlotState state;
+public:
+    ParkingSlot();
+    SlotState getState() const;
+    bool isFree() const;
+    bool reserve();
+    bool markOccupied();
+    bool markExpired();
+    bool release();
+    const char* stateName() const;
+};
+
+class ParkingBlock {
+    char id[NAME_LEN];
+    int capacity;
+    ParkingSlot* slots;
+public:
+    ParkingBlock(const char* blockId, int numSlots);
+    ParkingBlock(const ParkingBlock& other);
+    ParkingBlock& operator=(const ParkingBlock& other);
+    ~ParkingBlock();
+
+    const char* getId() const { return id; }
+    int  getCapacity() const { return capacity; }
+    SlotState getSlotStateAt(int index) const { return (index >= 0 && index < capacity) ? slots[index].getState() : SLOT_FREE; }
+    int  findFreeSlotIndex() const;
+    bool hasFreeSlot() const;
+    int  countByState(SlotState s) const;
+    int  usedCount() const;
+    bool reserveSlot(int index);
+    bool occupySlot(int index);
+    bool expireSlot(int index);
+    bool releaseSlot(int index);
+
+    friend ostream& operator<<(ostream& out, const ParkingBlock& b);
+};
+
+namespace BlockUtils {
+    void insertionSortById(ParkingBlock** arr, int n);
+    int  binarySearchById(ParkingBlock** arr, int n, const char* id);
+    void quickSortByOccupancy(ParkingBlock** arr, int low, int high);
+}
+
+ParkingSlot::ParkingSlot() : state(SLOT_FREE) {}
+SlotState ParkingSlot::getState() const { return state; }
+bool ParkingSlot::isFree() const { return state == SLOT_FREE; }
+bool ParkingSlot::reserve()      { if (state != SLOT_FREE)     return false; state = SLOT_RESERVED; return true; }
+bool ParkingSlot::markOccupied() { if (state != SLOT_RESERVED) return false; state = SLOT_OCCUPIED; return true; }
+bool ParkingSlot::markExpired()  { if (state != SLOT_RESERVED) return false; state = SLOT_EXPIRED;  return true; }
+bool ParkingSlot::release()      { state = SLOT_FREE; return true; }
+const char* ParkingSlot::stateName() const {
+    switch (state) {
+        case SLOT_FREE:     return "FREE";
+        case SLOT_RESERVED: return "RESERVED";
+        case SLOT_OCCUPIED: return "OCCUPIED";
+        default:            return "EXPIRED";
+    }
+}
+
+ParkingBlock::ParkingBlock(const char* blockId, int numSlots) {
+    copyStr(id, blockId, NAME_LEN);
+    if (numSlots > 0) {
+        capacity = numSlots;
+    } else {
+        capacity = 1;
+    }
+    slots = new ParkingSlot[capacity];
+}
+
+ParkingBlock::ParkingBlock(const ParkingBlock& other) {
+    copyStr(id, other.id, NAME_LEN);
+    capacity = other.capacity;
+    slots = new ParkingSlot[capacity];
+    for (int i = 0; i < capacity; i++) slots[i] = other.slots[i];
+}
+
+ParkingBlock& ParkingBlock::operator=(const ParkingBlock& other) {
+    if (this == &other) return *this;
+    delete[] slots;
+    copyStr(id, other.id, NAME_LEN);
+    capacity = other.capacity;
+    slots = new ParkingSlot[capacity];
+    for (int i = 0; i < capacity; i++) slots[i] = other.slots[i];
+    return *this;
+}
+ParkingBlock::~ParkingBlock() { delete[] slots; }
+
+int ParkingBlock::findFreeSlotIndex() const {
+    for (int i = 0; i < capacity; i++)
+        if (slots[i].isFree()) return i;
+    return -1;
+}
+bool ParkingBlock::hasFreeSlot() const { return findFreeSlotIndex() != -1; }
+
+int ParkingBlock::countByState(SlotState s) const {
+    int total = 0;
+    for (int i = 0; i < capacity; i++)
+        if (slots[i].getState() == s) total++;
+    return total;
+}
+int ParkingBlock::usedCount() const { return capacity - countByState(SLOT_FREE); }
+
+bool ParkingBlock::reserveSlot(int index) { return (index >= 0 && index < capacity) && slots[index].reserve(); }
+bool ParkingBlock::occupySlot(int index)  { return (index >= 0 && index < capacity) && slots[index].markOccupied(); }
+bool ParkingBlock::expireSlot(int index)  { return (index >= 0 && index < capacity) && slots[index].markExpired(); }
+bool ParkingBlock::releaseSlot(int index) { return (index >= 0 && index < capacity) && slots[index].release(); }
+
+ostream& operator<<(ostream& out, const ParkingBlock& b) {
+    out << "Block " << b.id << " [" << b.usedCount() << "/" << b.capacity << " used]  ";
+    for (int i = 0; i < b.capacity; i++) out << "(" << i << ":" << b.slots[i].stateName() << ") ";
+    return out;
+}
+
+void BlockUtils::insertionSortById(ParkingBlock** arr, int n) {
+    for (int i = 1; i < n; i++) {
+        ParkingBlock* key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && strcmp(arr[j]->getId(), key->getId()) > 0) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+}
+
+int BlockUtils::binarySearchById(ParkingBlock** arr, int n, const char* id) {
+    int low = 0, high = n - 1;
+    while (low <= high) {
+        int mid = (low + high) / 2;
+        int comparison = strcmp(id, arr[mid]->getId());
+        if (comparison == 0) return mid;
+        if (comparison < 0) high = mid - 1; else low = mid + 1;
+    }
+    return -1;
+}
+
+static int partitionByOccupancy(ParkingBlock** arr, int low, int high) {
+    int pivot = arr[high]->usedCount();
+    int i = low - 1;
+    for (int j = low; j < high; j++) {
+        if (arr[j]->usedCount() >= pivot) {
+            i++;
+            genericSwap(arr[i], arr[j]);
+        }
+    }
+    genericSwap(arr[i + 1], arr[high]);
+    return i + 1;
+}
+
+void BlockUtils::quickSortByOccupancy(ParkingBlock** arr, int low, int high) {
+    if (low < high) {
+        int p = partitionByOccupancy(arr, low, high);
+        quickSortByOccupancy(arr, low, p - 1);
+        quickSortByOccupancy(arr, p + 1, high);
+    }
+}
