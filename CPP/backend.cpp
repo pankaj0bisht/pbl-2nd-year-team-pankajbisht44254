@@ -1522,3 +1522,919 @@ static void decodeFormPart(const char* input, int length, char* output, int outS
 
     output[outputIndex] = '\0';
 }
+static bool formValue(const char* body, const char* key, char* output, int outSize) {
+    if (!body || !key || !output || outSize <= 0) return false;
+
+    output[0] = '\0';
+    const char* current = body;
+    size_t keyLength = strlen(key);
+
+    while (*current) {
+        const char* end = strchr(current, '&');
+        if (!end) end = current + strlen(current);
+
+        const char* equal = (const char*)memchr(current, '=', (size_t)(end - current));
+        if (equal && (size_t)(equal - current) == keyLength &&
+            strncmp(current, key, keyLength) == 0) {
+            decodeFormPart(equal + 1, (int)(end - equal - 1), output, outSize);
+            return true;
+        }
+
+        current = (*end == '&') ? end + 1 : end;
+    }
+
+    return false;
+}
+
+
+static void processHtmlPost(const char* path, const char* body,
+                            char* page, int pageSize,
+                            char* message, int messageSize) {
+    copyStr(message, "", messageSize);
+    copyStr(page, "dashboard", pageSize);
+
+    if (strcmp(path, "/register-vehicle") == 0) {
+        char number[NAME_LEN] = "";
+        char owner[60] = "";
+        char type[40] = "";
+        char category[40] = "";
+
+        formValue(body, "vehicleNumber", number, sizeof(number));
+        formValue(body, "owner", owner, sizeof(owner));
+        formValue(body, "type", type, sizeof(type));
+        formValue(body, "category", category, sizeof(category));
+
+        bool registered = addRegisteredVehicle(number, owner, type, category,
+                                               message, messageSize);
+        if (registered) gActivityLog.log("VEHICLE REGISTERED");
+        copyStr(page, "vehicles", pageSize);
+    }
+    else if (strcmp(path, "/make-reservation") == 0) {
+        char number[NAME_LEN] = "";
+        char block[NAME_LEN] = "";
+        formValue(body, "vehicleNumber", number, sizeof(number));
+        formValue(body, "blockId", block, sizeof(block));
+
+        Vehicle* vehicle = webFindVehicle(number);
+        if (!vehicle) {
+            copyStr(message, "Register this vehicle first", messageSize);
+        } else {
+            try {
+                int id = reserveWithExceptionAudit(*gManager, *vehicle, block);
+                snprintf(message, messageSize, "Reservation #%d confirmed", id);
+            } catch (ParkingException& error) {
+                copyStr(message, error.what(), messageSize);
+            }
+        }
+        copyStr(page, "reservations", pageSize);
+    }
+    else if (strcmp(path, "/emergency-allocate") == 0) {
+        gLastAI.made = false;
+        char number[NAME_LEN] = "";
+        char owner[60] = "";
+        char entry[NAME_LEN] = "A";
+        char errorMessage[120] = "";
+
+        formValue(body, "vehicleNumber", number, sizeof(number));
+        formValue(body, "owner", owner, sizeof(owner));
+        formValue(body, "entryBlock", entry, sizeof(entry));
+
+        Vehicle* vehicle = webFindVehicle(number);
+        if (!vehicle) {
+            bool added = addRegisteredVehicle(number, owner, "Emergency", "Emergency",
+                                              errorMessage, sizeof(errorMessage));
+            if (added) vehicle = webFindVehicle(number);
+            else copyStr(message, errorMessage, messageSize);
+        }
+
+        if (vehicle) {
+            if (vehicle->getPriority() != 0) {
+                copyStr(message, "This number is already registered as a non-emergency vehicle",
+                        messageSize);
+            } else {
+                try {
+                    gLastAI.made = false;
+                    int route[MAX_BLOCKS];
+                    int routeLength = 0;
+                    int chosenIndex = -1;
+                    int distance = -1;
+                    int freeSlots = 0;
+                    int score = 0;
+
+                    int id = gManager->makeEmergencyReservation(*vehicle, entry, route,
+                                                               routeLength, chosenIndex,
+                                                               distance, freeSlots, score);
+
+                    gLastAI.made = true;
+                    copyStr(gLastAI.vehicleNumber, number, NAME_LEN);
+                    copyStr(gLastAI.entryBlock, entry, NAME_LEN);
+                    copyStr(gLastAI.selectedBlock,
+                            gManager->getBlocks()[chosenIndex]->getId(), NAME_LEN);
+                    gLastAI.distance = distance;
+                    gLastAI.freeSlots = freeSlots;
+                    gLastAI.score = score;
+                    gLastAI.pathLength = routeLength;
+
+                    for (int i = 0; i < routeLength; ++i) gLastAI.path[i] = route[i];
+
+                    snprintf(message, messageSize,
+                             "AI assigned %s to Block %s. Reservation #%d created.",
+                             number, gLastAI.selectedBlock, id);
+                } catch (ParkingException& error) {
+                    copyStr(message, error.what(), messageSize);
+                }
+            }
+        }
+        copyStr(page, "ai", pageSize);
+    }
+    else if (strcmp(path, "/reservation-action") == 0) {
+        char action[30] = "";
+        char idText[30] = "";
+        formValue(body, "action", action, sizeof(action));
+        formValue(body, "reservationId", idText, sizeof(idText));
+        int id = atoi(idText);
+        bool success = false;
+
+        if (strcmp(action, "undo") == 0) {
+            success = gManager->undoLastReservation();
+            copyStr(message, success ? "Last reservation undone" : "Nothing to undo",
+                    messageSize);
+        }
+        else if (strcmp(action, "cancel") == 0) {
+            success = gManager->cancelReservation(id);
+            copyStr(message, success ? "Reservation cancelled" : "Reservation not found",
+                    messageSize);
+        }
+        else if (strcmp(action, "checkin") == 0) {
+            success = gManager->checkIn(id);
+            copyStr(message, success ? "Vehicle checked in" : "Cannot check in this reservation",
+                    messageSize);
+        }
+        else if (strcmp(action, "noshow") == 0) {
+            char number[NAME_LEN] = "";
+            if (gManager->markNoShow(id, number)) {
+                gNoShows.recordNoShow(number);
+                Vehicle* vehicle = webFindVehicle(number);
+                char minutesText[20] = "0";
+                formValue(body, "minutesLate", minutesText, sizeof(minutesText));
+                int minutesLate = atoi(minutesText);
+                int rate = vehicle ? vehicle->getFineRate() : 20;
+                int fine = gFines.applyFine(number, minutesLate, rate, gActivityLog);
+
+                if (gNoShows.isRepeatOffender(number)) {
+                    snprintf(message, messageSize,
+                             "No-show recorded. Fine: Rs %d. ALERT: repeat offender (%d no-shows).",
+                             fine, gNoShows.getNoShowCount(number));
+                } else {
+                    snprintf(message, messageSize,
+                             "No-show recorded for %s. Fine: Rs %d", number, fine);
+                }
+                success = true;
+            } else {
+                copyStr(message, "Cannot mark no-show for this reservation", messageSize);
+            }
+        }
+        else {
+            copyStr(message, "Unknown reservation action", messageSize);
+        }
+
+        if (!success && message[0] == '\0') copyStr(message, "Action failed", messageSize);
+        copyStr(page, "reservations", pageSize);
+    }
+    else if (strcmp(path, "/save-log") == 0) {
+        bool saved = gActivityLog.saveToFile("activity_log.txt");
+        copyStr(message, saved ? "Activity log saved to activity_log.txt"
+                               : "Could not save activity log", messageSize);
+        copyStr(page, "logs", pageSize);
+    }
+    else {
+        copyStr(page, "dashboard", pageSize);
+        copyStr(message, "Unknown form action", messageSize);
+    }
+}
+
+static bool sendAll(socket_t client, const char* data, int length) {
+    int sent = 0;
+    while (sent < length) {
+#ifdef _WIN32
+        int n = send(client, data + sent, length - sent, 0);
+#else
+        int n = (int)send(client, data + sent, (size_t)(length - sent), MSG_NOSIGNAL);
+#endif
+        if (n <= 0) return false;
+        sent += n;
+    }
+    return true;
+}
+static void sendHttp(socket_t client, int status, const char* contentType, const char* body) {
+    const char* reason = status == 200 ? "OK" : status == 400 ? "Bad Request" : status == 404 ? "Not Found" : "Internal Server Error";
+    char header[512];
+    int bodyLen = (int)strlen(body);
+    int headerLen = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\nContent-Type: %s; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+        status, reason, contentType, bodyLen);
+    sendAll(client, header, headerLen);
+    sendAll(client, body, bodyLen);
+}
+
+static bool startsWithIgnoreCase(const char* text, const char* prefix) {
+    if (!text || !prefix) return false;
+    while (*prefix) {
+        if (tolower((unsigned char)*text) != tolower((unsigned char)*prefix)) return false;
+        ++text;
+        ++prefix;
+    }
+    return true;
+}
+static int contentLengthFromHeader(const char* request) {
+    const char* p = request;
+    while (p && *p) {
+        const char* end = strstr(p, "\r\n");
+        if (!end || end == p) break;
+        if (startsWithIgnoreCase(p, "Content-Length:")) return atoi(p + 15);
+        p = end + 2;
+    }
+    return 0;
+}
+static bool readWholeFile(const char* fileName, char* output, int capacity) {
+    FILE* file = fopen(fileName, "rb");
+    if (!file) return false;
+    size_t bytesRead = fread(output, 1, (size_t)capacity - 1, file);
+    fclose(file);
+    output[bytesRead] = '\0';
+    return true;
+}
+
+
+
+static void jsonText(char* out, int capacity, const char* value) {
+    if (!value) return;
+    for (const unsigned char* p = (const unsigned char*)value; *p; ++p) {
+        if (*p == '"' || *p == '\\') appendText(out, capacity, "\\%c", *p);
+        else if (*p == '\n') appendText(out, capacity, "\\n");
+        else if (*p == '\r') appendText(out, capacity, "\\r");
+        else if (*p == '\t') appendText(out, capacity, "\\t");
+        else if (*p >= 32) appendText(out, capacity, "%c", *p);
+    }
+}
+
+
+static void buildStateJson(char* out, int capacity) {
+    out[0] = '\0';
+    int total = 0, freeSlots = 0, reserved = 0, occupied = 0;
+    for (int i = 0; i < gManager->getBlockCount(); ++i) {
+        ParkingBlock* b = gManager->getBlocks()[i];
+        total += b->getCapacity();
+        freeSlots += b->countByState(SLOT_FREE);
+        reserved += b->countByState(SLOT_RESERVED);
+        occupied += b->countByState(SLOT_OCCUPIED);
+    }
+    appendText(out, capacity,
+        "{\"summary\":{\"total\":%d,\"free\":%d,\"reserved\":%d,\"occupied\":%d,\"waiting\":%d,\"vehicles\":%d,\"fines\":%d},",
+        total, freeSlots, reserved, occupied, gManager->waitlistSize(), gRegistryCount,
+        gFines.getTotalCollected());
+
+    appendText(out, capacity, "\"blocks\":[");
+    for (int i = 0; i < gManager->getBlockCount(); ++i) {
+        ParkingBlock* b = gManager->getBlocks()[i];
+        if (i) appendText(out, capacity, ",");
+        appendText(out, capacity,
+            "{\"id\":\""); jsonText(out, capacity, b->getId());
+        appendText(out, capacity,
+            "\",\"capacity\":%d,\"free\":%d,\"reserved\":%d,\"occupied\":%d,\"percent\":%d}",
+            b->getCapacity(), b->countByState(SLOT_FREE),
+            b->countByState(SLOT_RESERVED), b->countByState(SLOT_OCCUPIED),
+            b->getCapacity() ? b->usedCount() * 100 / b->getCapacity() : 0);
+    }
+
+    appendText(out, capacity, "],\"vehicles\":[");
+    for (int i = 0; i < gRegistryCount; ++i) {
+        if (i) appendText(out, capacity, ",");
+        appendText(out, capacity, "{\"number\":\"");
+        jsonText(out, capacity, gRegistry[i].vehicle->getNumber());
+        appendText(out, capacity, "\",\"owner\":\"");
+        jsonText(out, capacity, gRegistry[i].owner);
+        appendText(out, capacity, "\",\"type\":\"");
+        jsonText(out, capacity, gRegistry[i].vehicle->getType());
+        appendText(out, capacity, "\",\"category\":\"");
+        jsonText(out, capacity, priorityName(gRegistry[i].vehicle->getPriority()));
+        appendText(out, capacity, "\"}");
+    }
+
+    appendText(out, capacity, "],\"reservations\":[");
+    for (int i = 0; i < gManager->reservationCount(); ++i) {
+        const Reservation* r = gManager->reservationAt(i);
+        if (!r) continue;
+        if (i) appendText(out, capacity, ",");
+        appendText(out, capacity, "{\"id\":%d,\"vehicle\":\"", r->getId());
+        jsonText(out, capacity, r->getVehicleNo());
+        appendText(out, capacity, "\",\"owner\":\"");
+        jsonText(out, capacity, ownerFor(r->getVehicleNo()));
+        appendText(out, capacity, "\",\"block\":\"");
+        jsonText(out, capacity, r->getBlockId());
+        appendText(out, capacity, "\",\"slot\":%d,\"priority\":\"", r->getSlot());
+        jsonText(out, capacity, priorityName(r->getPriority()));
+        appendText(out, capacity, "\",\"status\":\"");
+        jsonText(out, capacity, r->statusName());
+        appendText(out, capacity, "\"}");
+    }
+
+    appendText(out, capacity, "],\"waitlist\":[");
+    for (int i = 0; i < gManager->waitlistSize(); ++i) {
+        WaitEntry e;
+        if (!gManager->getWaitlistEntry(i, e)) continue;
+        if (i) appendText(out, capacity, ",");
+        appendText(out, capacity, "{\"position\":%d,\"vehicle\":\"", i + 1);
+        jsonText(out, capacity, e.vehicleNo);
+        appendText(out, capacity, "\",\"block\":\"");
+        jsonText(out, capacity, e.blockId);
+        appendText(out, capacity, "\",\"priority\":\"");
+        jsonText(out, capacity, priorityName(e.priority));
+        appendText(out, capacity, "\"}");
+    }
+
+    appendText(out, capacity, "],\"noShows\":[");
+    bool firstNoShow = true;
+    for (int i = 0; ; ++i) {
+        char number[NAME_LEN]; int count = 0;
+        if (!gNoShows.getEntryAt(i, number, NAME_LEN, count)) break;
+        if (!firstNoShow) appendText(out, capacity, ",");
+        firstNoShow = false;
+        appendText(out, capacity, "{\"vehicle\":\"");
+        jsonText(out, capacity, number);
+        appendText(out, capacity, "\",\"count\":%d}", count);
+    }
+
+    appendText(out, capacity, "],\"logs\":[");
+    for (int i = 0; i < gActivityLog.size(); ++i) {
+        if (i) appendText(out, capacity, ",");
+        appendText(out, capacity, "\"");
+        jsonText(out, capacity, gActivityLog.getAt(i));
+        appendText(out, capacity, "\"");
+    }
+
+    appendText(out, capacity, "],\"matrix\":[");
+    for (int r = 0; r < gManager->getBlockCount(); ++r) {
+        if (r) appendText(out, capacity, ",");
+        appendText(out, capacity, "[");
+        for (int c = 0; c < gManager->getBlockCount(); ++c) {
+            if (c) appendText(out, capacity, ",");
+            appendText(out, capacity, "%d", gManager->adjacencyAt(r, c));
+        }
+        appendText(out, capacity, "]");
+    }
+    appendText(out, capacity, "],\"ai\":");
+    if (gLastAI.made) {
+        appendText(out, capacity, "{\"made\":true,\"vehicle\":\"");
+        jsonText(out, capacity, gLastAI.vehicleNumber);
+        appendText(out, capacity, "\",\"entry\":\"");
+        jsonText(out, capacity, gLastAI.entryBlock);
+        appendText(out, capacity, "\",\"selected\":\"");
+        jsonText(out, capacity, gLastAI.selectedBlock);
+        appendText(out, capacity, "\",\"distance\":%d,\"freeSlots\":%d,\"path\":[",
+                   gLastAI.distance, gLastAI.freeSlots);
+        for (int i = 0; i < gLastAI.pathLength; ++i) {
+            if (i) appendText(out, capacity, ",");
+            appendText(out, capacity, "\"");
+            jsonText(out, capacity, gManager->getBlocks()[gLastAI.path[i]]->getId());
+            appendText(out, capacity, "\"");
+        }
+        appendText(out, capacity, "]}");
+    } else {
+        appendText(out, capacity, "{\"made\":false}");
+    }
+    appendText(out, capacity, "}");
+}
+
+// Build graph traversal output on the C++ side for the browser graph page.
+static void buildGraphJson(char* out, int capacity, const char* startBlock) {
+    out[0] = '\0';
+    int bfs[MAX_BLOCKS], dfs[MAX_BLOCKS];
+    int bfsCount = gManager->bfsOrder(startBlock, bfs);
+    int dfsCount = gManager->dfsOrder(startBlock, dfs);
+    appendText(out, capacity, "{\"bfs\":[");
+    for (int i = 0; i < bfsCount; ++i) {
+        if (i) appendText(out, capacity, ",");
+        appendText(out, capacity, "\"");
+        jsonText(out, capacity, gManager->getBlocks()[bfs[i]]->getId());
+        appendText(out, capacity, "\"");
+    }
+    appendText(out, capacity, "],\"dfs\":[");
+    for (int i = 0; i < dfsCount; ++i) {
+        if (i) appendText(out, capacity, ",");
+        appendText(out, capacity, "\"");
+        jsonText(out, capacity, gManager->getBlocks()[dfs[i]]->getId());
+        appendText(out, capacity, "\"");
+    }
+    appendText(out, capacity, "]}");
+}
+
+static bool serveStaticFile(socket_t client, const char* path) {
+    // The complete frontend (HTML, CSS and JavaScript) is kept in one file.
+    if (strcmp(path, "/") != 0 && strcmp(path, "/index.html") != 0) {
+        return false;
+    }
+
+    // The single-page frontend is larger because its CSS and JavaScript are
+    // embedded directly inside index.html.
+    char fileData[80000];
+    if (!readWholeFile("HTML/index.html", fileData, sizeof(fileData))) {
+        sendHttp(client, 500, "text/plain", "Cannot open HTML/index.html. Run the server from the project root folder.");
+        return true;
+    }
+    sendHttp(client, 200, "text/html", fileData);
+    return true;
+}
+
+static bool apiPostPath(const char* apiPath, char* oldPath, int oldPathSize) {
+    const char* prefix = "/api";
+    if (strncmp(apiPath, prefix, 4) != 0) return false;
+    copyStr(oldPath, apiPath + 4, oldPathSize);
+    return true;
+}
+
+static void handleConnection(socket_t client) {
+    char request[65536]; int received = 0; request[0] = '\0'; int expected = -1;
+    while (received < (int)sizeof(request) - 1) {
+#ifdef _WIN32
+        int n = recv(client, request + received, (int)sizeof(request) - received - 1, 0);
+#else
+        int n = (int)recv(client, request + received, sizeof(request) - (size_t)received - 1, 0);
+#endif
+        if (n <= 0) break;
+        received += n; request[received] = '\0';
+        char* headerEnd = strstr(request, "\r\n\r\n");
+        if (headerEnd && expected < 0) expected = (int)(headerEnd - request) + 4 + contentLengthFromHeader(request);
+        if (expected >= 0 && received >= expected) break;
+        if (!headerEnd && received > 16000) break;
+    }
+    // Nothing arrived (client connected and went quiet, or the read timed
+    // out): just close the socket. Replying here would send bytes to a
+    // peer that has usually already gone away.
+    if (received <= 0) return;
+    char method[16] = "", target[256] = "", path[256] = "";
+    if (sscanf(request, "%15s %255s", method, target) != 2) {
+        sendHttp(client, 400, "text/html", "<!DOCTYPE html><html><body><h1>Bad request</h1></body></html>"); return;
+    }
+    copyStr(path, target, sizeof(path));
+    char* query = strchr(path, '?');
+    char queryCopy[256] = "";
+    if (query) { copyStr(queryCopy, query + 1, sizeof(queryCopy)); *query = '\0'; }
+    char* body = strstr(request, "\r\n\r\n"); body = body ? body + 4 : (char*)"";
+    char pageName[32] = "dashboard", message[220] = "", graphStart[NAME_LEN] = "A";
+    if (strcmp(method, "GET") == 0 && serveStaticFile(client, path)) return;
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/state") == 0) {
+        char json[60000];
+        buildStateJson(json, sizeof(json));
+        sendHttp(client, 200, "application/json", json);
+        return;
+    }
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/graph") == 0) {
+        char startBlock[NAME_LEN] = "A";
+        formValue(queryCopy, "start", startBlock, sizeof(startBlock));
+        char json[2048];
+        buildGraphJson(json, sizeof(json), startBlock);
+        sendHttp(client, 200, "application/json", json);
+        return;
+    }
+    if (strcmp(method, "POST") == 0 && strncmp(path, "/api/", 5) == 0) {
+        char oldPath[256];
+        if (!apiPostPath(path, oldPath, sizeof(oldPath))) {
+            sendHttp(client, 404, "application/json", "{\"message\":\"Unknown API route\"}");
+            return;
+        }
+        // Unknown /api/... POSTs must stay JSON (the frontend does
+        // response.json()), not fall through to the HTML form handler.
+        if (strcmp(oldPath, "/register-vehicle") != 0 &&
+            strcmp(oldPath, "/make-reservation") != 0 &&
+            strcmp(oldPath, "/emergency-allocate") != 0 &&
+            strcmp(oldPath, "/reservation-action") != 0 &&
+            strcmp(oldPath, "/save-log") != 0) {
+            sendHttp(client, 404, "application/json", "{\"message\":\"Unknown API route\"}");
+            return;
+        }
+        processHtmlPost(oldPath, body, pageName, sizeof(pageName), message, sizeof(message));
+        char jsonMessage[600];
+        jsonMessage[0] = '\0';
+        appendText(jsonMessage, sizeof(jsonMessage), "{\"message\":\"");
+        jsonText(jsonMessage, sizeof(jsonMessage), message);
+        appendText(jsonMessage, sizeof(jsonMessage), "\"}");
+        sendHttp(client, 200, "application/json", jsonMessage);
+        return;
+    }
+    if (strcmp(method, "GET") == 0 && strncmp(path, "/api/", 5) == 0) {
+        // Unknown /api/... GETs stay JSON instead of the HTML 404 page.
+        sendHttp(client, 404, "application/json", "{\"message\":\"Unknown API route\"}");
+        return;
+    }
+    if (strcmp(method, "GET") == 0) {
+        if (strcmp(path, "/dashboard") == 0) copyStr(pageName,"dashboard",sizeof(pageName));
+        else if (strcmp(path, "/vehicles") == 0) copyStr(pageName,"vehicles",sizeof(pageName));
+        else if (strcmp(path, "/reservations") == 0) copyStr(pageName,"reservations",sizeof(pageName));
+        else if (strcmp(path, "/waitlist") == 0) copyStr(pageName,"waitlist",sizeof(pageName));
+        else if (strcmp(path, "/ai") == 0) copyStr(pageName,"ai",sizeof(pageName));
+        else if (strcmp(path, "/graph") == 0) { copyStr(pageName,"graph",sizeof(pageName)); formValue(queryCopy,"start",graphStart,sizeof(graphStart)); }
+        else if (strcmp(path, "/noshows") == 0) copyStr(pageName,"noshows",sizeof(pageName));
+        else if (strcmp(path, "/reports") == 0) copyStr(pageName,"reports",sizeof(pageName));
+        else if (strcmp(path, "/logs") == 0) copyStr(pageName,"logs",sizeof(pageName));
+        else if (strcmp(path, "/lab") == 0) copyStr(pageName,"lab",sizeof(pageName));
+        else if (strcmp(path, "/favicon.ico") == 0) { sendHttp(client,404,"text/plain",""); return; }
+        else { sendHttp(client,404,"text/html","<!DOCTYPE html><html><body><h1>Page not found</h1><p><a href=\"/dashboard\">Dashboard</a></p></body></html>"); return; }
+    } else if (strcmp(method, "POST") == 0) {
+        processHtmlPost(path,body,pageName,sizeof(pageName),message,sizeof(message));
+    } else {
+        sendHttp(client,400,"text/html","<!DOCTYPE html><html><body><h1>Unsupported request</h1></body></html>"); return;
+    }
+    char response[64000];
+    renderHtmlPage(response,sizeof(response),pageName,message,graphStart);
+    sendHttp(client,200,"text/html",response);
+}
+
+// -----------------------------------------------------------------------------
+// Console menu. It uses the same C++ parking objects as the web interface.
+// Choose option 9 to exit the console menu and start the browser server.
+// -----------------------------------------------------------------------------
+static void readConsoleLine(const char* prompt, char* out, int size) {
+    cout << prompt;
+    cin.getline(out, size);
+    if (cin.fail()) { cin.clear(); cin.ignore(10000, '\n'); out[0] = '\0'; }
+}
+
+static void showConsoleVehicles() {
+    cout << "\n--- REGISTERED VEHICLES ---\n";
+    if (gRegistryCount == 0) { cout << "No vehicles registered yet.\n"; return; }
+    cout << left << setw(18) << "Vehicle Number" << setw(22) << "Owner" << setw(18) << "Type" << "Category\n";
+    cout << string(70, '-') << '\n';
+    for (int i = 0; i < gRegistryCount; ++i) {
+        cout << left << setw(18) << gRegistry[i].vehicle->getNumber()
+             << setw(22) << gRegistry[i].owner
+             << setw(18) << gRegistry[i].vehicle->getType()
+             << priorityName(gRegistry[i].vehicle->getPriority()) << '\n';
+    }
+}
+
+static void showConsoleParking() {
+    cout << "\n--- PARKING AVAILABILITY ---\n";
+    for (int i = 0; i < gBlockCount; ++i) {
+        ParkingBlock* b = gBlocks[i];
+        cout << "Block " << b->getId() << " | Capacity: " << b->getCapacity()
+             << " | Free: " << b->countByState(SLOT_FREE)
+             << " | Reserved: " << b->countByState(SLOT_RESERVED)
+             << " | Occupied: " << b->countByState(SLOT_OCCUPIED) << '\n';
+    }
+}
+
+static void consoleAddVehicle() {
+    char number[NAME_LEN], owner[60], type[30], category[30], message[160];
+    readConsoleLine("Vehicle number: ", number, sizeof(number));
+    readConsoleLine("Owner name: ", owner, sizeof(owner));
+    cout << "Vehicle type: 1. Two Wheeler  2. Four Wheeler  3. Emergency\nChoose: ";
+    char choice[16]; cin.getline(choice, sizeof(choice));
+    if (strcmp(choice, "1") == 0) copyStr(type, "Two Wheeler", sizeof(type));
+    else if (strcmp(choice, "2") == 0) copyStr(type, "Four Wheeler", sizeof(type));
+    else if (strcmp(choice, "3") == 0) copyStr(type, "Emergency", sizeof(type));
+    else { cout << "Invalid vehicle type.\n"; return; }
+    if (strcmp(type, "Emergency") == 0) copyStr(category, "Emergency", sizeof(category));
+    else {
+        cout << "Category: 1. Student  2. Faculty\nChoose: ";
+        cin.getline(choice, sizeof(choice));
+        if (strcmp(choice, "1") == 0) copyStr(category, "Student", sizeof(category));
+        else if (strcmp(choice, "2") == 0) copyStr(category, "Faculty", sizeof(category));
+        else { cout << "Invalid category.\n"; return; }
+    }
+    if (addRegisteredVehicle(number, owner, type, category, message, sizeof(message)))
+        cout << "SUCCESS: " << message << '\n';
+    else cout << "ERROR: " << message << '\n';
+}
+
+static void consoleMakeReservation() {
+    char number[NAME_LEN], block[NAME_LEN];
+    readConsoleLine("Registered vehicle number: ", number, sizeof(number));
+    Vehicle* vehicle = webFindVehicle(number);
+    if (!vehicle) { cout << "Vehicle not found. Register it first.\n"; return; }
+    readConsoleLine("Preferred block (A/B/C): ", block, sizeof(block));
+    try {
+        int id = gManager->makeReservation(*vehicle, block);
+        if (id > 0) cout << "Reservation successful. Reservation ID: " << id << '\n';
+        else cout << "Request added to the waiting list.\n";
+    } catch (ParkingException& e) { cout << "NOTICE: " << e.what() << '\n'; }
+}
+
+static void consoleCancelReservation() {
+    cout << "Active reservations:\n";
+    for (int i = 0; i < gManager->reservationCount(); ++i) {
+        const Reservation* r = gManager->reservationAt(i);
+        if (r) cout << "ID: " << r->getId() << " | Vehicle: " << r->getVehicleNo()
+                    << " | Block: " << r->getBlockId() << " | Slot: " << (r->getSlot() + 1) << '\n';
+    }
+    cout << "Enter reservation ID to cancel: ";
+    char line[32]; cin.getline(line, sizeof(line));
+    int id = atoi(line);
+    if (id <= 0) { cout << "Invalid reservation ID.\n"; return; }
+    cout << (gManager->cancelReservation(id) ? "Reservation cancelled.\n" : "Reservation ID not found.\n");
+}
+
+static void consoleViewReservations() {
+    cout << "\n===== RESERVATIONS =====\n";
+    if (gManager->reservationCount() == 0) {
+        cout << "No reservations found.\n";
+        return;
+    }
+    gManager->showReservations();
+}
+
+static void consoleViewWaitingList() {
+    cout << "\n===== WAITING LIST =====\n";
+    if (gManager->waitlistSize() == 0) {
+        cout << "Waiting list is empty.\n";
+        return;
+    }
+    cout << left << setw(10) << "Position" << setw(18) << "Vehicle"
+         << setw(14) << "Block" << "Priority\n";
+    cout << string(55, '-') << '\n';
+    for (int i = 0; i < gManager->waitlistSize(); ++i) {
+        WaitEntry entry;
+        if (!gManager->getWaitlistEntry(i, entry)) continue;
+        cout << left << setw(10) << (i + 1) << setw(18) << entry.vehicleNo
+             << setw(14) << entry.blockId << priorityName(entry.priority) << '\n';
+    }
+}
+
+static void consoleGenerateReports() {
+    int total = 0, freeSlots = 0, reserved = 0, occupied = 0;
+    cout << "\n===== PARKING REPORT =====\n";
+    for (int i = 0; i < gManager->getBlockCount(); ++i) {
+        ParkingBlock* block = gManager->getBlocks()[i];
+        total += block->getCapacity();
+        freeSlots += block->countByState(SLOT_FREE);
+        reserved += block->countByState(SLOT_RESERVED);
+        occupied += block->countByState(SLOT_OCCUPIED);
+        int percent = block->getCapacity()
+            ? block->usedCount() * 100 / block->getCapacity() : 0;
+        cout << "Block " << block->getId()
+             << " | Capacity: " << block->getCapacity()
+             << " | Free: " << block->countByState(SLOT_FREE)
+             << " | Reserved: " << block->countByState(SLOT_RESERVED)
+             << " | Occupied: " << block->countByState(SLOT_OCCUPIED)
+             << " | Occupancy: " << percent << "%\n";
+    }
+    cout << "-----------------------------------------------\n"
+         << "Total slots: " << total << "\n"
+         << "Available: " << freeSlots << "\n"
+         << "Reserved: " << reserved << "\n"
+         << "Occupied: " << occupied << "\n"
+         << "Waiting list entries: " << gManager->waitlistSize() << "\n"
+         << "Registered vehicles: " << gRegistryCount << "\n"
+         << "Fines collected: Rs " << gFines.getTotalCollected() << "\n";
+}
+
+static void consoleEmergencyAllocation() {
+    char number[NAME_LEN], entry[NAME_LEN];
+    readConsoleLine("Registered emergency vehicle number: ", number, sizeof(number));
+    Vehicle* vehicle = webFindVehicle(number);
+    if (!vehicle) {
+        cout << "Vehicle not found. Register it first as an Emergency vehicle.\n";
+        return;
+    }
+    if (vehicle->getPriority() != 0) {
+        cout << "This vehicle is not registered with Emergency priority.\n";
+        return;
+    }
+    readConsoleLine("Campus entry block (A/B/C): ", entry, sizeof(entry));
+    int route[MAX_BLOCKS];
+    int routeLength = 0, chosenIndex = -1, distance = -1, freeSlots = 0, score = 0;
+    try {
+        int id = gManager->makeEmergencyReservation(*vehicle, entry, route,
+            routeLength, chosenIndex, distance, freeSlots, score);
+        if (chosenIndex < 0 || chosenIndex >= gManager->getBlockCount()) {
+            cout << "Emergency allocation could not select a parking block.\n";
+            return;
+        }
+        cout << "Emergency vehicle allocated successfully.\n"
+             << "Reservation ID: " << id << "\n"
+             << "Allocated block: " << gManager->getBlocks()[chosenIndex]->getId() << "\n"
+             << "Route distance: " << distance << " edge(s)\n"
+             << "Free slots at allocation: " << freeSlots << "\n"
+             << "Route: ";
+        for (int i = 0; i < routeLength; ++i) {
+            if (i) cout << " -> ";
+            cout << gManager->getBlocks()[route[i]]->getId();
+        }
+        cout << '\n';
+    } catch (ParkingException& error) {
+        cout << "Allocation failed: " << error.what() << '\n';
+    }
+}
+
+static int runWebServer();
+
+static void consoleMenu() {
+    for (;;) {
+        cout << "\n===== CAMPUS PARKING SYSTEM =====\n"
+             << "\n1. Register Vehicle"
+             << "\n2. Make Reservation"
+             << "\n3. Cancel Reservation"
+             << "\n4. View Reservations"
+             << "\n5. View Available Slots"
+             << "\n6. View Waiting List"
+             << "\n7. Emergency Vehicle Allocation"
+             << "\n8. Generate Reports"
+             << "\n9. Start web server"
+             << "\n10. Exit"
+             << "\n\nEnter your choice: ";
+        char choice[16];
+        cin.getline(choice, sizeof(choice));
+        if (strcmp(choice, "1") == 0) consoleAddVehicle();
+        else if (strcmp(choice, "2") == 0) consoleMakeReservation();
+        else if (strcmp(choice, "3") == 0) consoleCancelReservation();
+        else if (strcmp(choice, "4") == 0) consoleViewReservations();
+        else if (strcmp(choice, "5") == 0) showConsoleParking();
+        else if (strcmp(choice, "6") == 0) consoleViewWaitingList();
+        else if (strcmp(choice, "7") == 0) consoleEmergencyAllocation();
+        else if (strcmp(choice, "8") == 0) consoleGenerateReports();
+        else if (strcmp(choice, "9") == 0) {
+            cout << "Starting web server at http://127.0.0.1:8765 ...\n";
+            cout << "Keep this window open while using the website. Stop the server with Ctrl+C.\n";
+            runWebServer();
+        }
+        else if (strcmp(choice, "10") == 0) return;
+        else cout << "Invalid choice. Please enter a number from 1 to 10.\n";
+    }
+}
+
+#ifdef PARKING_SELF_TEST
+static int testsPassed = 0;
+static int testsFailed = 0;
+static void checkTest(bool condition, const char* name) {
+    if (condition) { ++testsPassed; cout << "[PASS] " << name << '\n'; }
+    else { ++testsFailed; cout << "[FAIL] " << name << '\n'; }
+}
+int main() {
+    VehicleIndex hash;
+    bool hashOk = true;
+    for (int i = 0; i < 150; ++i) { char key[NAME_LEN]; snprintf(key, sizeof(key), "VH%03d", i); if (!hash.insert(key, i + 1)) hashOk = false; }
+    checkTest(hashOk && hash.size() == 150 && hash.getReservationId("VH077") == 78, "Chained hash table insertion and lookup");
+    checkTest(hash.remove("VH077") && !hash.contains("VH077"), "Chained hash table deletion");
+
+    ParkingSlot state;
+    checkTest(!state.markOccupied() && state.reserve() && state.markOccupied() && state.release() && state.isFree(),
+              "Parking slot rejects invalid transitions and supports valid transitions");
+
+    ParkingBlock original("COPY", 2);
+    original.reserveSlot(0);
+    ParkingBlock copied(original);
+    original.releaseSlot(0);
+    checkTest(copied.countByState(SLOT_RESERVED) == 1 && original.countByState(SLOT_FREE) == 2,
+              "ParkingBlock copy constructor performs deep copy");
+    ParkingBlock assigned("TEMP", 1); assigned = copied;
+    checkTest(assigned.getCapacity() == 2 && assigned.countByState(SLOT_RESERVED) == 1,
+              "ParkingBlock assignment operator copies slots");
+
+    ParkingBlock a("A", 1), b("B", 1), c("C", 1), d("D", 1);
+    ParkingBlock* blocks[4] = { &d, &c, &b, &a };
+    VehicleIndex index; ActivityLog activity;
+    ReservationManager manager(blocks, 4, index, activity);
+    manager.connectBlocks("A", "B"); manager.connectBlocks("B", "C");
+    int bfs[MAX_BLOCKS], dfs[MAX_BLOCKS];
+    int bfsCount = manager.bfsOrder("A", bfs), dfsCount = manager.dfsOrder("A", dfs);
+    checkTest(bfsCount == 3 && dfsCount == 3 && manager.blocksReachable("A", "C") && !manager.blocksReachable("A", "D"),
+              "Adjacency matrix BFS/DFS and unreachable-node detection");
+
+    FourWheeler car1("CAR001", 2), car2("CAR002", 2);
+    checkTest(manager.makeReservation(car1, "A") > 0 && manager.makeReservation(car2, "A") > 0,
+              "BFS redirection reaches a free neighbouring block");
+    EmergencyVehicle ambulance("AMB001");
+    int path[MAX_BLOCKS], pathLength=0, chosen=-1, distance=-1, freeSlots=0, score=0;
+    int emergencyId = manager.makeEmergencyReservation(ambulance, "A", path, pathLength, chosen, distance, freeSlots, score);
+    checkTest(emergencyId > 0 && strcmp(manager.getBlocks()[chosen]->getId(), "C") == 0 && distance == 2 && pathLength == 3,
+              "AI emergency allocator selects the nearest reachable free block with an explainable route");
+
+    ParkingBlock oneSlot("P", 1); ParkingBlock* oneBlock[1] = { &oneSlot };
+    VehicleIndex priorityIndex; ActivityLog priorityLog;
+    ReservationManager priorityManager(oneBlock, 1, priorityIndex, priorityLog);
+    FourWheeler firstStudent("STU001", 2), waitingStudent("STU002", 2);
+    EmergencyVehicle waitingEmergency("EMG002");
+    int firstBooking = priorityManager.makeReservation(firstStudent, "P");
+    try { priorityManager.makeReservation(waitingStudent, "P"); } catch (ParkingException&) {}
+    try { priorityManager.makeReservation(waitingEmergency, "P"); } catch (ParkingException&) {}
+    priorityManager.cancelReservation(firstBooking);
+    const Reservation* promoted = priorityManager.reservationAt(0);
+    checkTest(promoted && strcmp(promoted->getVehicleNo(), "EMG002") == 0 && priorityManager.waitlistSize() == 1,
+              "Emergency waitlist entry is promoted before a student entry");
+
+    NoShowTree tree;
+    tree.recordNoShow("CAR001"); tree.recordNoShow("CAR001"); tree.recordNoShow("CAR001");
+    checkTest(tree.getNoShowCount("CAR001") == 3 && tree.isRepeatOffender("CAR001"), "BST repeat-offender threshold");
+
+    UndoStack stack; bool pushed = true;
+    for (int i = 0; i < 100; ++i) if (!stack.push(i)) pushed = false;
+    int discarded = -1;
+    checkTest(pushed && stack.isFull() && !stack.push(101), "Undo stack full condition");
+    for (int i = 0; i < 100; ++i) if (!stack.pop(discarded)) pushed = false;
+    checkTest(pushed && stack.isEmpty() && !stack.pop(discarded), "Undo stack empty condition");
+
+    FineManager fines;
+    checkTest(fines.calculateFine(0,20)==0 && fines.calculateFine(15,20)==20 &&
+              fines.calculateFine(16,20)==40 && fines.calculateFine(30,20)==40,
+              "Fine boundaries at 0, 15, 16 and 30 minutes");
+    activity.log("SELF TEST FILE WRITE");
+    checkTest(activity.saveToFile("test_activity_log.txt"), "Activity log fstream save");
+
+    int values1[5]={5,1,4,2,3}, values2[5]={5,1,4,2,3}, values3[5]={5,1,4,2,3}, temp[5];
+    bubbleSort(values1,5); mergeSort(values2,temp,0,4); heapSort(values3,5);
+    checkTest(values1[0]==1&&values1[4]==5&&values2[0]==1&&values2[4]==5&&values3[0]==1&&values3[4]==5,
+              "Bubble, merge and heap sort demonstrations");
+    OOPNumber add = addOOPObjects(OOPNumber(4), OOPNumber(6));
+    CampusCoordinator coordinator("Test");
+    checkTest(add.getValue()==10 && coordinator.role()!=0, "OOP operator and virtual-base inheritance demonstrations");
+
+    cout << "\nTest summary: " << testsPassed << " passed, " << testsFailed << " failed.\n";
+    return testsFailed == 0 ? 0 : 1;
+}
+#else
+static int runWebServer() {
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { cerr << "Winsock initialization failed\n"; return 1; }
+#else
+    // A browser that closes a connection mid-response must not kill the
+    // server with SIGPIPE; send() then fails cleanly instead and the
+    // server moves on to the next client.
+    signal(SIGPIPE, SIG_IGN);
+#endif
+    socket_t server = socket(AF_INET, SOCK_STREAM, 0);
+    if (server == INVALID_SOCKET) { cerr << "Could not create server socket\n"; return 1; }
+    int reuse = 1;
+#ifdef _WIN32
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+#else
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#endif
+    sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(8765);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // local computer only
+    if (bind(server, (sockaddr*)&address, sizeof(address)) == SOCKET_ERROR) {
+        cerr << "Could not bind port 8765. Close another app using this port.\n";
+#ifdef _WIN32
+        closesocket(server); WSACleanup();
+#else
+        close(server);
+#endif
+        return 1;
+    }
+    if (listen(server, 10) == SOCKET_ERROR) { cerr << "Could not listen on port 8765\n"; return 1; }
+    cout << "Campus Parking backend is running.\nOpen http://127.0.0.1:8765 in your browser.\nPress Ctrl+C to stop.\n";
+    while (true) {
+        socket_t client = accept(server, 0, 0);
+        if (client == INVALID_SOCKET) continue;
+        
+#ifdef _WIN32
+        DWORD timeoutMs = 5000;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+#else
+        struct timeval timeout;
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
+        handleConnection(client);
+#ifdef _WIN32
+        closesocket(client);
+#else
+        close(client);
+#endif
+    }
+#ifdef _WIN32
+    closesocket(server); WSACleanup();
+#else
+    close(server);
+#endif
+    return 0;
+}
+
+int main(int argc, char* argv[]) {
+    static ParkingBlock blockA("A", 2);
+    static ParkingBlock blockB("B", 2);
+    static ParkingBlock blockC("C", 1);
+    gBlocks[0] = &blockC; gBlocks[1] = &blockA; gBlocks[2] = &blockB;
+    gBlockCount = 3;
+    static ReservationManager manager(gBlocks, gBlockCount, gVehicleIndex, gActivityLog);
+    gManager = &manager;
+    gActivityLog.loadFromFile("activity_log.txt");
+    gManager->connectBlocks("A", "B");
+    gManager->connectBlocks("B", "C");
+
+    cout << "Campus parking system initialized.\n";
+    if (argc > 1 && strcmp(argv[1], "--server") == 0) {
+        cout << "Starting browser server at http://127.0.0.1:8765 ...\n";
+        return runWebServer();
+    }
+    consoleMenu();
+    cout << "Exiting Campus Parking System.\n";
+    return 0;
+}
+#endif // PARKING_SELF_TEST
