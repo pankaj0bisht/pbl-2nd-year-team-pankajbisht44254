@@ -580,3 +580,497 @@ void ReportGenerator::printOccupancyReport(ParkingBlock** blocks, int n) const {
 }
 
 enum ResStatus { RES_BOOKED, RES_CHECKED_IN, RES_EXPIRED };
+class Reservation {
+    static int counter;
+
+    int id;
+    char vehicleNo[NAME_LEN];
+    char blockId[NAME_LEN];
+    int slotIndex;
+    int priority;
+    ResStatus status;
+public:
+    Reservation();
+    Reservation(const char* vehicleNo, const char* blockId, int slot, int priority);
+    Reservation(const Reservation& other);
+    Reservation& operator=(const Reservation& other);
+    Reservation& setStatus(ResStatus s);
+    int  getId() const { return id; }
+    const char* getVehicleNo() const { return vehicleNo; }
+    const char* getBlockId() const { return blockId; }
+    int  getSlot() const { return slotIndex; }
+    int  getPriority() const { return priority; }
+    ResStatus getStatus() const { return status; }
+    const char* statusName() const;
+    static int totalCreated() { return counter; }
+};
+
+class ReservationList {
+    struct Node { Reservation data; Node* prev; Node* next; };
+    Node* head;
+    Node* tail;
+    int count;
+    ReservationList(const ReservationList&);
+    ReservationList& operator=(const ReservationList&);
+public:
+    ReservationList();
+    ~ReservationList();
+    void add(const Reservation& r);
+    bool removeById(int id);
+    Reservation* findById(int id);
+    Reservation* findByVehicle(const char* vehicleNo);
+    int  size() const { return count; }
+    const Reservation* at(int index) const;
+    void display() const;
+};
+
+struct WaitEntry {
+    char vehicleNo[NAME_LEN];
+    char blockId[NAME_LEN];
+    int  priority;
+};
+
+class LinkedQueue {
+    struct Node { WaitEntry data; Node* next; };
+    Node* front;
+    Node* rear;
+    int count;
+    LinkedQueue(const LinkedQueue&);
+    LinkedQueue& operator=(const LinkedQueue&);
+public:
+    LinkedQueue();
+    ~LinkedQueue();
+    void enqueue(const WaitEntry& e);
+    bool dequeue(WaitEntry& e);
+    bool peek(WaitEntry& e) const;
+    bool getAt(int index, WaitEntry& e) const;
+    bool isEmpty() const { return count == 0; }
+    int  size() const { return count; }
+    void display() const;
+};
+
+class PriorityWaitlist {
+    LinkedQueue levels[3];
+public:
+    void push(const char* vehicleNo, const char* blockId, int priority);
+    bool pop(WaitEntry& e);
+    bool peek(WaitEntry& e) const;
+    bool getAt(int index, WaitEntry& e) const;
+    bool isEmpty() const;
+    int  size() const;
+    void display() const;
+};
+
+class BlockMap {
+    int adj[MAX_BLOCKS][MAX_BLOCKS];
+    void dfsVisit(int node, int n, bool visited[], int order[], int& count) const;
+public:
+    BlockMap();
+    void addEdge(int a, int b);
+    bool isNeighbor(int a, int b) const { return a >= 0 && b >= 0 && a < MAX_BLOCKS && b < MAX_BLOCKS && adj[a][b] == 1; }
+    int findNearestFreeBlock(int start, ParkingBlock** blocks, int n) const;
+    int breadthFirst(int start, int n, int order[]) const;
+    int depthFirst(int start, int n, int order[]) const;
+    bool isReachable(int start, int target, int n) const;
+    int chooseEmergencyBlock(int start, ParkingBlock** blocks, int n, int& distance,
+                             int& freeSlots, int& score, int path[], int& pathLength) const;
+    int adjacencyAt(int row, int col) const {
+        return (row >= 0 && col >= 0 && row < MAX_BLOCKS && col < MAX_BLOCKS) ? adj[row][col] : 0;
+    }
+};
+
+// Explainable rule-based AI wrapper: asks the graph for the best candidate.
+// The heuristic is shortest route first, then more free slots, then lower occupancy.
+class EmergencyAllocationAI {
+public:
+    int chooseBlock(const BlockMap& map, int entry, ParkingBlock** blocks, int n,
+                    int& distance, int& freeSlots, int& score,
+                    int path[], int& pathLength) const {
+        return map.chooseEmergencyBlock(entry, blocks, n, distance, freeSlots, score, path, pathLength);
+    }
+    const char* modelType() const { return "Explainable rule-based decision engine"; }
+};
+
+class ReservationManager {
+    ParkingBlock* blocks[MAX_BLOCKS];
+    int blockCount;
+    BlockMap map;
+    EmergencyAllocationAI emergencyAI;
+    ReservationList list;
+    PriorityWaitlist waitlist;
+    UndoStack undo;
+    VehicleIndex& index;
+    ActivityLog& log;
+
+    int  placeBooking(const char* vehicleNo, int priority, int preferredIdx);
+    void promoteFromWaitlist();
+    int  blockIndexOf(const char* blockId) const;
+    ReservationManager(const ReservationManager&);
+    ReservationManager& operator=(const ReservationManager&);
+public:
+    ReservationManager(ParkingBlock** inputBlocks, int n, VehicleIndex& idx, ActivityLog& activityLog);
+    void connectBlocks(const char* a, const char* b);
+
+    int  makeReservation(const Vehicle& v, const char* preferredBlockId);
+    int  makeEmergencyReservation(const Vehicle& v, const char* entryBlock,
+                                  int path[], int& pathLength, int& chosenIndex,
+                                  int& distance, int& freeSlots, int& score);
+    int  bfsOrder(const char* startBlock, int order[]) const;
+    int  dfsOrder(const char* startBlock, int order[]) const;
+    bool blocksReachable(const char* from, const char* to) const;
+    int  adjacencyAt(int row, int col) const { return map.adjacencyAt(row, col); }
+    bool cancelReservation(int reservationId);
+    bool undoLastReservation();
+    bool checkIn(int reservationId);
+    bool markNoShow(int reservationId, char* vehicleNoOut);
+
+    void showReservations() const { list.display(); }
+    void showWaitlist() const { waitlist.display(); }
+    int  waitlistSize() const { return waitlist.size(); }
+    ParkingBlock** getBlocks() { return blocks; }
+    int  getBlockCount() const { return blockCount; }
+    int  reservationCount() const { return list.size(); }
+    const Reservation* reservationAt(int index) const { return list.at(index); }
+    bool getWaitlistEntry(int index, WaitEntry& entry) const { return waitlist.getAt(index, entry); }
+};
+
+int Reservation::counter = 0;
+
+Reservation::Reservation() : id(0), slotIndex(-1), priority(2), status(RES_BOOKED) {
+    vehicleNo[0] = blockId[0] = '\0';
+}
+
+Reservation::Reservation(const char* vehicle, const char* block, int slot, int prio) {
+    id = ++counter;
+    copyStr(vehicleNo, vehicle, NAME_LEN);
+    copyStr(blockId, block, NAME_LEN);
+    slotIndex = slot;
+    priority = prio;
+    status = RES_BOOKED;
+}
+
+Reservation::Reservation(const Reservation& other) {
+    id = other.id;
+    copyStr(vehicleNo, other.vehicleNo, NAME_LEN);
+    copyStr(blockId, other.blockId, NAME_LEN);
+    slotIndex = other.slotIndex;
+    priority = other.priority;
+    status = other.status;
+}
+Reservation& Reservation::operator=(const Reservation& other) {
+    if (this != &other) {
+        id = other.id;
+        copyStr(vehicleNo, other.vehicleNo, NAME_LEN);
+        copyStr(blockId, other.blockId, NAME_LEN);
+        slotIndex = other.slotIndex;
+        priority = other.priority;
+        status = other.status;
+    }
+    return *this;
+}
+Reservation& Reservation::setStatus(ResStatus s) { this->status = s; return *this; }
+const char* Reservation::statusName() const {
+    if (status == RES_BOOKED) return "BOOKED";
+    if (status == RES_CHECKED_IN) return "CHECKED-IN";
+    return "EXPIRED";
+}
+
+ReservationList::ReservationList() : head(0), tail(0), count(0) {}
+ReservationList::~ReservationList() {
+    while (head) {
+        Node* oldHead = head;
+        head = head->next;
+        delete oldHead;
+    }
+}
+
+void ReservationList::add(const Reservation& r) {
+    Node* newNode = new Node;
+    newNode->data = r;
+    newNode->prev = tail;
+    newNode->next = 0;
+    if (tail) tail->next = newNode; else head = newNode;
+    tail = newNode;
+    count++;
+}
+
+bool ReservationList::removeById(int id) {
+    for (Node* p = head; p; p = p->next) {
+        if (p->data.getId() == id) {
+            if (p->prev) p->prev->next = p->next; else head = p->next;
+            if (p->next) p->next->prev = p->prev; else tail = p->prev;
+            delete p;
+            count--;
+            return true;
+        }
+    }
+    return false;
+}
+Reservation* ReservationList::findById(int id) {
+    for (Node* p = head; p; p = p->next)
+        if (p->data.getId() == id) return &p->data;
+    return 0;
+}
+Reservation* ReservationList::findByVehicle(const char* vehicleNo) {
+    for (Node* p = head; p; p = p->next)
+        if (strcmp(p->data.getVehicleNo(), vehicleNo) == 0) return &p->data;
+    return 0;
+}
+const Reservation* ReservationList::at(int index) const {
+    if (index < 0) return 0;
+    Node* p = head;
+    while (p && index > 0) { p = p->next; index--; }
+    return p ? &p->data : 0;
+}
+void ReservationList::display() const {
+    cout << "Active reservations (" << count << "):" << endl;
+    for (Node* p = head; p; p = p->next)
+        cout << "  #" << p->data.getId() << "  " << p->data.getVehicleNo() << "  block "
+             << p->data.getBlockId() << " slot " << p->data.getSlot() << "  "
+             << p->data.statusName() << endl;
+}
+
+LinkedQueue::LinkedQueue() : front(0), rear(0), count(0) {}
+LinkedQueue::~LinkedQueue() {
+    while (front) {
+        Node* oldFront = front;
+        front = front->next;
+        delete oldFront;
+    }
+}
+
+void LinkedQueue::enqueue(const WaitEntry& e) {
+    Node* newNode = new Node;
+    newNode->data = e;
+    newNode->next = 0;
+    if (rear) rear->next = newNode; else front = newNode;
+    rear = newNode;
+    count++;
+}
+
+bool LinkedQueue::dequeue(WaitEntry& e) {
+    if (!front) return false;
+    Node* oldFront = front;
+    e = oldFront->data;
+    front = front->next;
+    if (!front) rear = 0;
+    delete oldFront;
+    count--;
+    return true;
+}
+bool LinkedQueue::peek(WaitEntry& e) const {
+    if (!front) return false;
+    e = front->data;
+    return true;
+}
+bool LinkedQueue::getAt(int index, WaitEntry& e) const {
+    if (index < 0) return false;
+    Node* p = front;
+    while (p && index > 0) { p = p->next; index--; }
+    if (!p) return false;
+    e = p->data;
+    return true;
+}
+void LinkedQueue::display() const {
+    for (Node* p = front; p; p = p->next)
+        cout << p->data.vehicleNo << "(wants " << p->data.blockId << ") ";
+}
+
+void PriorityWaitlist::push(const char* vehicleNo, const char* blockId, int priority) {
+    if (priority < 0) priority = 0;
+    if (priority > 2) priority = 2;
+    WaitEntry e;
+    copyStr(e.vehicleNo, vehicleNo, NAME_LEN);
+    copyStr(e.blockId, blockId, NAME_LEN);
+    e.priority = priority;
+    levels[priority].enqueue(e);
+}
+
+bool PriorityWaitlist::pop(WaitEntry& e) {
+    for (int level = 0; level < 3; level++)
+        if (levels[level].dequeue(e)) return true;
+    return false;
+}
+bool PriorityWaitlist::peek(WaitEntry& e) const {
+    for (int level = 0; level < 3; level++)
+        if (levels[level].peek(e)) return true;
+    return false;
+}
+bool PriorityWaitlist::getAt(int index, WaitEntry& e) const {
+    if (index < 0) return false;
+    for (int level = 0; level < 3; level++) {
+        if (index < levels[level].size()) return levels[level].getAt(index, e);
+        index -= levels[level].size();
+    }
+    return false;
+}
+bool PriorityWaitlist::isEmpty() const { return size() == 0; }
+int PriorityWaitlist::size() const { return levels[0].size() + levels[1].size() + levels[2].size(); }
+void PriorityWaitlist::display() const {
+    const char* names[3] = { "Emergency", "Faculty  ", "Student  " };
+    cout << "Waitlist (" << size() << "):" << endl;
+    for (int level = 0; level < 3; level++) {
+        cout << "  " << names[level] << ": ";
+        levels[level].display();
+        cout << endl;
+    }
+}
+
+BlockMap::BlockMap() {
+    for (int i = 0; i < MAX_BLOCKS; i++)
+        for (int j = 0; j < MAX_BLOCKS; j++) adj[i][j] = 0;
+}
+
+void BlockMap::addEdge(int a, int b) {
+    if (a < 0 || b < 0 || a >= MAX_BLOCKS || b >= MAX_BLOCKS) return;
+    adj[a][b] = adj[b][a] = 1;
+}
+
+int BlockMap::breadthFirst(int start, int n, int order[]) const {
+    if (start < 0 || start >= n || n > MAX_BLOCKS) return 0;
+    bool visited[MAX_BLOCKS] = {false};
+    int queue[MAX_BLOCKS], front = 0, rear = 0, count = 0;
+    visited[start] = true; queue[rear++] = start;
+    while (front < rear) {
+        int u = queue[front++]; order[count++] = u;
+        for (int v = 0; v < n; ++v)
+            if (adj[u][v] && !visited[v]) { visited[v] = true; queue[rear++] = v; }
+    }
+    return count;
+}
+void BlockMap::dfsVisit(int node, int n, bool visited[], int order[], int& count) const {
+    visited[node] = true; order[count++] = node;
+    for (int v = 0; v < n; ++v)
+        if (adj[node][v] && !visited[v]) dfsVisit(v, n, visited, order, count);
+}
+int BlockMap::depthFirst(int start, int n, int order[]) const {
+    if (start < 0 || start >= n || n > MAX_BLOCKS) return 0;
+    bool visited[MAX_BLOCKS] = {false}; int count = 0;
+    dfsVisit(start, n, visited, order, count);
+    return count;
+}
+bool BlockMap::isReachable(int start, int target, int n) const {
+    if (start < 0 || target < 0 || start >= n || target >= n || n > MAX_BLOCKS) return false;
+    int order[MAX_BLOCKS]; int count = breadthFirst(start, n, order);
+    for (int i = 0; i < count; ++i) if (order[i] == target) return true;
+    return false;
+}
+int BlockMap::findNearestFreeBlock(int start, ParkingBlock** blocks, int n) const {
+    if (start < 0 || start >= n || n > MAX_BLOCKS) return -1;
+    bool visited[MAX_BLOCKS] = {false}; int queue[MAX_BLOCKS], front = 0, rear = 0;
+    visited[start] = true; queue[rear++] = start;
+    while (front < rear) {
+        int u = queue[front++];
+        if (u != start && blocks[u]->hasFreeSlot()) return u;
+        for (int v = 0; v < n; ++v)
+            if (adj[u][v] && !visited[v]) { visited[v] = true; queue[rear++] = v; }
+    }
+    return -1;
+}
+int BlockMap::chooseEmergencyBlock(int start, ParkingBlock** blocks, int n, int& bestDistance,
+                                   int& bestFreeSlots, int& bestScore, int path[], int& pathLength) const {
+    bestDistance = -1; bestFreeSlots = 0; bestScore = -1; pathLength = 0;
+    if (start < 0 || start >= n || n > MAX_BLOCKS) return -1;
+    int distance[MAX_BLOCKS], parent[MAX_BLOCKS], queue[MAX_BLOCKS];
+    for (int i = 0; i < n; ++i) { distance[i] = -1; parent[i] = -1; }
+    int front = 0, rear = 0; queue[rear++] = start; distance[start] = 0;
+    while (front < rear) {
+        int u = queue[front++];
+        for (int v = 0; v < n; ++v) {
+            if (adj[u][v] && distance[v] == -1) {
+                distance[v] = distance[u] + 1; parent[v] = u; queue[rear++] = v;
+            }
+        }
+    }
+    int best = -1;
+    for (int i = 0; i < n; ++i) {
+        if (distance[i] < 0 || !blocks[i]->hasFreeSlot()) continue;
+        int freeNow = blocks[i]->countByState(SLOT_FREE);
+        int usedPercent = (blocks[i]->usedCount() * 100) / blocks[i]->getCapacity();
+        // Explainable heuristic: shortest path first, then more free spaces, then lower occupancy.
+        int candidateScore = 10000 - distance[i] * 1000 + freeNow * 10 - usedPercent;
+        if (best == -1 || distance[i] < bestDistance ||
+            (distance[i] == bestDistance && freeNow > bestFreeSlots) ||
+            (distance[i] == bestDistance && freeNow == bestFreeSlots && candidateScore > bestScore)) {
+            best = i; bestDistance = distance[i]; bestFreeSlots = freeNow; bestScore = candidateScore;
+        }
+    }
+    if (best != -1) {
+        int reversePath[MAX_BLOCKS], len = 0, p = best;
+        while (p != -1 && len < MAX_BLOCKS) { reversePath[len++] = p; p = parent[p]; }
+        pathLength = len;
+        for (int i = 0; i < len; ++i) path[i] = reversePath[len - 1 - i];
+    }
+    return best;
+}
+
+ReservationManager::ReservationManager(ParkingBlock** inputBlocks, int n, VehicleIndex& idx, ActivityLog& activityLog)
+    : index(idx), log(activityLog) {
+    if (n > MAX_BLOCKS) {
+        blockCount = MAX_BLOCKS;
+    } else {
+        blockCount = n;
+    }
+    for (int i = 0; i < blockCount; i++) blocks[i] = inputBlocks[i];
+    BlockUtils::insertionSortById(blocks, blockCount);
+}
+
+int ReservationManager::blockIndexOf(const char* blockId) const {
+    return BlockUtils::binarySearchById(const_cast<ParkingBlock**>(blocks), blockCount, blockId);
+}
+
+void ReservationManager::connectBlocks(const char* a, const char* b) {
+    int i = blockIndexOf(a), j = blockIndexOf(b);
+    if (i != -1 && j != -1) map.addEdge(i, j);
+}
+int ReservationManager::bfsOrder(const char* startBlock, int order[]) const {
+    return map.breadthFirst(blockIndexOf(startBlock), blockCount, order);
+}
+int ReservationManager::dfsOrder(const char* startBlock, int order[]) const {
+    return map.depthFirst(blockIndexOf(startBlock), blockCount, order);
+}
+bool ReservationManager::blocksReachable(const char* from, const char* to) const {
+    return map.isReachable(blockIndexOf(from), blockIndexOf(to), blockCount);
+}
+int ReservationManager::makeEmergencyReservation(const Vehicle& v, const char* entryBlock,
+                                                  int path[], int& pathLength, int& chosenIndex,
+                                                  int& distance, int& freeSlots, int& score) {
+    if (v.getPriority() != 0) throw ParkingException("AI emergency allocation accepts emergency vehicles only");
+    int start = blockIndexOf(entryBlock);
+    if (start == -1) throw ParkingException("Invalid emergency entry block");
+    if (index.contains(v.getNumber())) throw ParkingException("Double booking: vehicle already has a reservation");
+    chosenIndex = emergencyAI.chooseBlock(map, start, blocks, blockCount, distance, freeSlots, score, path, pathLength);
+    if (chosenIndex == -1) {
+        waitlist.push(v.getNumber(), entryBlock, 0);
+        index.insert(v.getNumber(), 0);
+        char line[100] = "AI WAITLISTED EMERGENCY "; strncat(line, v.getNumber(), 20); log.log(line);
+        throw ParkingException("No reachable free block. Emergency vehicle placed at the front of the priority waitlist.");
+    }
+    int id = placeBooking(v.getNumber(), 0, chosenIndex);
+    char line[100] = "AI ASSIGNED EMERGENCY "; strncat(line, v.getNumber(), 20);
+    strncat(line, " -> block ", 12); strncat(line, blocks[chosenIndex]->getId(), 10); log.log(line);
+    return id;
+}
+
+int ReservationManager::placeBooking(const char* vehicleNo, int priority, int preferredIdx) {
+    int target = preferredIdx;
+    if (!blocks[target]->hasFreeSlot())
+        target = map.findNearestFreeBlock(preferredIdx, blocks, blockCount);
+    if (target == -1) return -1;
+
+    int slot = blocks[target]->findFreeSlotIndex();
+    blocks[target]->reserveSlot(slot);
+    Reservation r(vehicleNo, blocks[target]->getId(), slot, priority);
+    list.add(r);
+    index.remove(vehicleNo);
+    index.insert(vehicleNo, r.getId());
+    undo.push(r.getId());
+
+    char line[100] = "BOOKED ";
+    strncat(line, vehicleNo, 20);
+    strncat(line, " -> block ", 12);
+    strncat(line, blocks[target]->getId(), 10);
+    log.log(line);
+    if (target != preferredIdx) log.log("  (redirected from full block)");
+    return r.getId();
+}
