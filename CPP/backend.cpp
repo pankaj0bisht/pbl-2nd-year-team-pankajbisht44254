@@ -359,7 +359,6 @@ void BlockUtils::quickSortByOccupancy(ParkingBlock** arr, int low, int high) {
     }
 }
 
-// Custom hash table using separate chaining. No STL containers are used.
 class VehicleIndex {
     struct Entry { char vehicleNo[NAME_LEN]; int reservationId; Entry* next; };
     static const int BUCKETS = 101;
@@ -679,8 +678,6 @@ public:
     }
 };
 
-// Explainable rule-based AI wrapper: asks the graph for the best candidate.
-// The heuristic is shortest route first, then more free slots, then lower occupancy.
 class EmergencyAllocationAI {
 public:
     int chooseBlock(const BlockMap& map, int entry, ParkingBlock** blocks, int n,
@@ -987,7 +984,6 @@ int BlockMap::chooseEmergencyBlock(int start, ParkingBlock** blocks, int n, int&
         if (distance[i] < 0 || !blocks[i]->hasFreeSlot()) continue;
         int freeNow = blocks[i]->countByState(SLOT_FREE);
         int usedPercent = (blocks[i]->usedCount() * 100) / blocks[i]->getCapacity();
-        // Explainable heuristic: shortest path first, then more free spaces, then lower occupancy.
         int candidateScore = 10000 - distance[i] * 1000 + freeNow * 10 - usedPercent;
         if (best == -1 || distance[i] < bestDistance ||
             (distance[i] == bestDistance && freeNow > bestFreeSlots) ||
@@ -1073,4 +1069,456 @@ int ReservationManager::placeBooking(const char* vehicleNo, int priority, int pr
     log.log(line);
     if (target != preferredIdx) log.log("  (redirected from full block)");
     return r.getId();
+}
+int ReservationManager::makeReservation(const Vehicle& v, const char* preferredBlockId) {
+    int preferred = blockIndexOf(preferredBlockId);
+    if (preferred == -1) throw ParkingException("Invalid block id");
+    if (index.contains(v.getNumber())) throw ParkingException("Double booking: vehicle already has a reservation");
+
+    int id = placeBooking(v.getNumber(), v.getPriority(), preferred);
+    if (id == -1) {
+        waitlist.push(v.getNumber(), preferredBlockId, v.getPriority());
+        index.insert(v.getNumber(), 0);
+        char line[100] = "WAITLISTED ";
+        strncat(line, v.getNumber(), 20);
+        log.log(line);
+        throw ParkingException("No free slot nearby - request added to waitlist");
+    }
+    return id;
+}
+
+void ReservationManager::promoteFromWaitlist() {
+    WaitEntry e;
+    while (waitlist.peek(e)) {
+        int preferred = blockIndexOf(e.blockId);
+        if (preferred == -1) { waitlist.pop(e); continue; }
+        if (placeBooking(e.vehicleNo, e.priority, preferred) == -1) break;
+        waitlist.pop(e);
+        char promotionMessage[100] = "WAITLIST PROMOTED ";
+        strncat(promotionMessage, e.vehicleNo, 20);
+        log.log(promotionMessage);
+    }
+}
+
+bool ReservationManager::cancelReservation(int id) {
+    Reservation* r = list.findById(id);
+    if (!r) return false;
+    int blockPos = blockIndexOf(r->getBlockId());
+    blocks[blockPos]->releaseSlot(r->getSlot());
+    index.remove(r->getVehicleNo());
+    char line[100] = "CANCELLED ";
+    strncat(line, r->getVehicleNo(), 20);
+    log.log(line);
+    list.removeById(id);
+    promoteFromWaitlist();
+    return true;
+}
+
+bool ReservationManager::undoLastReservation() {
+    int id;
+    while (undo.pop(id))
+        if (list.findById(id)) return cancelReservation(id);
+    return false;
+}
+
+bool ReservationManager::checkIn(int id) {
+    Reservation* r = list.findById(id);
+    if (!r || r->getStatus() != RES_BOOKED) return false;
+    int blockPos = blockIndexOf(r->getBlockId());
+    if (!blocks[blockPos]->occupySlot(r->getSlot())) return false;
+    r->setStatus(RES_CHECKED_IN);
+    char line[100] = "CHECK-IN ";
+    strncat(line, r->getVehicleNo(), 20);
+    log.log(line);
+    return true;
+}
+
+bool ReservationManager::markNoShow(int id, char* vehicleNoOut) {
+    Reservation* r = list.findById(id);
+    if (!r || r->getStatus() != RES_BOOKED) return false;
+    copyStr(vehicleNoOut, r->getVehicleNo(), NAME_LEN);
+    int blockPos = blockIndexOf(r->getBlockId());
+    blocks[blockPos]->expireSlot(r->getSlot());
+    blocks[blockPos]->releaseSlot(r->getSlot());
+    index.remove(vehicleNoOut);
+    char line[100] = "NO-SHOW ";
+    strncat(line, vehicleNoOut, 20);
+    log.log(line);
+    list.removeById(id);
+    promoteFromWaitlist();
+    return true;
+}
+
+static void tryReserve(ReservationManager& manager, const Vehicle& vehicle, const char* block) {
+    try {
+        int id = manager.makeReservation(vehicle, block);
+        cout << vehicle.getNumber() << " (" << vehicle.getType() << ") wants " << block
+             << " -> reservation #" << id << endl;
+    } catch (ParkingException& e) {
+        cout << vehicle.getNumber() << " wants " << block << " -> " << e.what() << endl;
+    }
+}
+
+void autoDemoPankaj() {
+
+    ParkingBlock a("A", 2), b("B", 2), c("C", 1);
+    ParkingBlock* blocks[3] = { &c, &a, &b };
+    VehicleIndex index;
+    ActivityLog log;
+    ReservationManager mgr(blocks, 3, index, log);
+    mgr.connectBlocks("A", "B");
+    mgr.connectBlocks("B", "C");
+    FineManager fines;
+    AlertSystem alerts;
+    NoShowTree noShows;
+
+    FourWheeler  f1("UK07-F1", 1), f2("UK07-F2", 1);
+    TwoWheeler   s1("UK07-S1", 2), s2("UK07-S2", 2), s3("UK07-S3", 2);
+    EmergencyVehicle amb("UK07-AMB");
+
+    cout << "\n--- 1. Normal bookings, then overcrowding in block A ---" << endl;
+    tryReserve(mgr, f1, "A");
+    tryReserve(mgr, f2, "A");
+    tryReserve(mgr, s1, "A");
+    alerts.checkCapacity(a);
+
+    cout << "\n--- 2. Error handling ---" << endl;
+    tryReserve(mgr, f1, "A");
+    tryReserve(mgr, s2, "Z");
+
+    cout << "\n--- 3. Fill the campus, then waitlist ---" << endl;
+    tryReserve(mgr, s2, "A");
+    tryReserve(mgr, s3, "A");
+    tryReserve(mgr, amb, "A");
+    mgr.showWaitlist();
+
+    cout << "\n--- 4. Cancel one booking: the emergency vehicle is served first ---" << endl;
+    mgr.cancelReservation(1);
+    mgr.showWaitlist();
+
+    cout << "\n--- 5. Check-in, no-show and fine ---" << endl;
+    mgr.checkIn(2);
+    char vno[NAME_LEN];
+    if (mgr.markNoShow(3, vno)) {
+        noShows.recordNoShow(vno);
+        int fine = fines.applyFine(vno, 40, s1.getFineRate(), log);
+        cout << vno << " did not show up, fine = Rs " << fine << endl;
+    }
+    mgr.showWaitlist();
+
+    cout << "\n--- 6. Undo last reservation (stack) ---" << endl;
+    if (mgr.undoLastReservation()) {
+        cout << "last reservation undone" << endl;
+    } else {
+        cout << "nothing to undo" << endl;
+    }
+
+    cout << "\n--- 7. Reports ---" << endl;
+    mgr.showReservations();
+    ReportGenerator().printOccupancyReport(mgr.getBlocks(), mgr.getBlockCount());
+    noShows.display();
+    cout << "Total fines collected: Rs " << fines.getTotalCollected() << endl;
+    log.display();
+}
+
+static void appendText(char* out, int capacity, const char* format, ...);
+
+static void bubbleSort(int data[], int n) {
+    for (int i = 0; i < n - 1; ++i) {
+        bool changed = false;
+        for (int j = 0; j < n - i - 1; ++j)
+            if (data[j] > data[j + 1]) { genericSwap(data[j], data[j + 1]); changed = true; }
+        if (!changed) break;
+    }
+}
+static void mergeValues(int data[], int temp[], int left, int mid, int right) {
+    int i = left, j = mid + 1, k = left;
+    while (i <= mid && j <= right) temp[k++] = data[i] <= data[j] ? data[i++] : data[j++];
+    while (i <= mid) temp[k++] = data[i++];
+    while (j <= right) temp[k++] = data[j++];
+    for (int x = left; x <= right; ++x) data[x] = temp[x];
+}
+static void mergeSort(int data[], int temp[], int left, int right) {
+    if (left >= right) return;
+    int mid = left + (right - left) / 2;
+    mergeSort(data, temp, left, mid); mergeSort(data, temp, mid + 1, right);
+    mergeValues(data, temp, left, mid, right);
+}
+static void heapify(int data[], int n, int root) {
+    int largest = root, left = 2 * root + 1, right = 2 * root + 2;
+    if (left < n && data[left] > data[largest]) largest = left;
+    if (right < n && data[right] > data[largest]) largest = right;
+    if (largest != root) { genericSwap(data[root], data[largest]); heapify(data, n, largest); }
+}
+static void heapSort(int data[], int n) {
+    for (int i = n / 2 - 1; i >= 0; --i) heapify(data, n, i);
+    for (int i = n - 1; i > 0; --i) { genericSwap(data[0], data[i]); heapify(data, i, 0); }
+}
+static int linearSearch(const int data[], int n, int key) {
+    for (int i = 0; i < n; ++i) if (data[i] == key) return i;
+    return -1;
+}
+
+class OOPNumber {
+    int value;
+public:
+    OOPNumber(int v = 0) : value(v) {}
+    OOPNumber(const OOPNumber& other) : value(other.value) {}
+    OOPNumber& operator=(const OOPNumber& other) { if (this != &other) value = other.value; return *this; }
+    OOPNumber operator+(const OOPNumber& other) const { return OOPNumber(value + other.value); }
+    OOPNumber operator-(const OOPNumber& other) const { return OOPNumber(value - other.value); }
+    OOPNumber& operator++() { ++value; return *this; }
+    OOPNumber operator++(int) { OOPNumber old(*this); value++; return old; }
+    int getValue() const { return value; }
+    friend ostream& operator<<(ostream& out, const OOPNumber& n) { out << n.value; return out; }
+    friend istream& operator>>(istream& in, OOPNumber& n) { in >> n.value; return in; }
+};
+static OOPNumber addOOPObjects(OOPNumber a, OOPNumber b) { return a + b; }
+static int calculateCharge(int minutes) { return minutes <= 0 ? 0 : ((minutes + 59) / 60) * 10; }
+static int calculateCharge(int minutes, int hourlyRate) {
+    return (minutes <= 0 || hourlyRate <= 0) ? 0 : ((minutes + 59) / 60) * hourlyRate;
+}
+
+class CampusPerson {
+protected:
+    char name[60];
+public:
+    CampusPerson(const char* n = "Campus user") { copyStr(name, n, 60); }
+    virtual ~CampusPerson() {}
+    virtual const char* role() const = 0;
+    const char* getName() const { return name; }
+};
+class StudentRole : virtual public CampusPerson {
+public:
+    StudentRole(const char* n = "Student") : CampusPerson(n) {}
+    const char* role() const { return "Student"; }
+};
+class FacultyRole : virtual public CampusPerson {
+public:
+    FacultyRole(const char* n = "Faculty") : CampusPerson(n) {}
+    const char* role() const { return "Faculty"; }
+};
+class CampusCoordinator : public StudentRole, public FacultyRole {
+public:
+    CampusCoordinator(const char* n) : CampusPerson(n), StudentRole(n), FacultyRole(n) {}
+    const char* role() const { return "Student-Faculty Coordinator"; }
+};
+
+struct RegisteredVehicle {
+    Vehicle* vehicle;
+    char owner[60];
+};
+
+static RegisteredVehicle gRegistry[200];
+static int gRegistryCount = 0;
+static ParkingBlock* gBlocks[MAX_BLOCKS];
+static int gBlockCount = 0;
+static VehicleIndex gVehicleIndex;
+static ActivityLog gActivityLog;
+static ReservationManager* gManager = 0;
+static FineManager gFines;
+static NoShowTree gNoShows;
+struct AIDecision {
+    bool made; char vehicleNumber[NAME_LEN]; char entryBlock[NAME_LEN]; char selectedBlock[NAME_LEN];
+    int distance; int freeSlots; int score; int path[MAX_BLOCKS]; int pathLength;
+};
+static AIDecision gLastAI = {false, "", "", "", -1, 0, 0, {0}, 0};
+
+static Vehicle* webFindVehicle(const char* number) {
+    for (int i = 0; i < gRegistryCount; i++)
+        if (strcmp(gRegistry[i].vehicle->getNumber(), number) == 0) return gRegistry[i].vehicle;
+    return 0;
+}
+static const char* priorityName(int p) {
+    if (p <= 0) return "Emergency";
+    if (p == 1) return "Faculty";
+    return "Student";
+}
+static const char* ownerFor(const char* number) {
+    for (int i = 0; i < gRegistryCount; i++)
+        if (strcmp(gRegistry[i].vehicle->getNumber(), number) == 0) return gRegistry[i].owner;
+    return "—";
+}
+
+static void appendText(char* out, int capacity, const char* format, ...) {
+    if (!out || capacity <= 0) return;
+    int used = (int)strlen(out);
+    if (used >= capacity - 1) return;
+    va_list args;
+    va_start(args, format);
+    vsnprintf(out + used, (size_t)(capacity - used), format, args);
+    va_end(args);
+}
+static int reserveWithExceptionAudit(ReservationManager& manager, const Vehicle& vehicle,
+                                     const char* block) {
+
+    return manager.makeReservation(vehicle, block);
+}
+
+static bool addRegisteredVehicle(const char* number, const char* owner, const char* type, const char* category, char* message, int messageSize) {
+    if (!number || !number[0] || !owner || !owner[0]) { copyStr(message, "Vehicle number and owner are required", messageSize); return false; }
+    if (strlen(number) >= NAME_LEN) { copyStr(message, "Vehicle number must be at most 15 characters", messageSize); return false; }
+    if (webFindVehicle(number)) { copyStr(message, "This vehicle is already registered", messageSize); return false; }
+    if (gRegistryCount >= 200) { copyStr(message, "Vehicle registry is full (200 vehicles)", messageSize); return false; }
+    Vehicle* v = 0;
+    int level = strcmp(category, "Faculty") == 0 ? 1 : 2;
+    if (strcmp(type, "Emergency") == 0 || strcmp(category, "Emergency") == 0) v = new EmergencyVehicle(number);
+    else if (strcmp(type, "Two Wheeler") == 0 || strcmp(type, "TwoWheeler") == 0) v = new TwoWheeler(number, level);
+    else if (strcmp(type, "Four Wheeler") == 0 || strcmp(type, "FourWheeler") == 0) v = new FourWheeler(number, level);
+    else { copyStr(message, "Choose a valid vehicle type", messageSize); return false; }
+    gRegistry[gRegistryCount].vehicle = v;
+    copyStr(gRegistry[gRegistryCount].owner, owner, 60);
+    gRegistryCount++;
+    copyStr(message, "Vehicle registered successfully", messageSize);
+    return true;
+}
+
+static void htmlText(char* out, int capacity, const char* value) {
+    if (!value) return;
+    for (const unsigned char* p = (const unsigned char*)value; *p; ++p) {
+        if (*p == '&') appendText(out, capacity, "&amp;");
+        else if (*p == '<') appendText(out, capacity, "&lt;");
+        else if (*p == '>') appendText(out, capacity, "&gt;");
+        else if (*p == '"') appendText(out, capacity, "&quot;");
+        else if (*p == '\'') appendText(out, capacity, "&#39;");
+        else if (*p >= 32 || *p == '\n') appendText(out, capacity, "%c", *p);
+    }
+}
+static void htmlCell(char* out, int capacity, const char* value) {
+    appendText(out, capacity, "<td>"); htmlText(out, capacity, value); appendText(out, capacity, "</td>");
+}
+static void htmlStart(char* out, int capacity, const char* title, const char* message) {
+    out[0] = '\0';
+    appendText(out, capacity, "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>");
+    htmlText(out, capacity, title);
+    appendText(out, capacity, "</title></head><body><h1>Overparking Resolver</h1>");
+    appendText(out, capacity, "<p>Smart Campus Parking Reservation, Redirection and Priority Waitlist System</p>");
+    appendText(out, capacity, "<p><a href=\"/dashboard\">Dashboard</a> | <a href=\"/vehicles\">Vehicles</a> | <a href=\"/reservations\">Reservations</a> | <a href=\"/waitlist\">Waiting List</a> | <a href=\"/ai\">Emergency AI</a> | <a href=\"/graph\">Graph BFS/DFS</a> | <a href=\"/noshows\">No-Shows</a> | <a href=\"/reports\">Reports</a> | <a href=\"/logs\">Activity Log</a> | <a href=\"/lab\">DSA/OOP Lab</a></p><hr>");
+    if (message && message[0]) {
+        appendText(out, capacity, "<p><strong>Message: "); htmlText(out, capacity, message); appendText(out, capacity, "</strong></p><hr>");
+    }
+}
+static void htmlEnd(char* out, int capacity) {
+    appendText(out, capacity, "<hr><p>Phase 3 demonstration | C++ backend + plain HTML frontend | No CSS or JavaScript</p></body></html>");
+}
+static void renderVehicleTable(char* out, int capacity) {
+    appendText(out, capacity, "<h2>Registered Vehicles</h2><table border=\"1\" cellpadding=\"5\"><tr><th>Vehicle Number</th><th>Owner</th><th>Type</th><th>Category</th></tr>");
+    for (int i = 0; i < gRegistryCount; ++i) {
+        appendText(out, capacity, "<tr>");
+        htmlCell(out, capacity, gRegistry[i].vehicle->getNumber());
+        htmlCell(out, capacity, gRegistry[i].owner);
+        htmlCell(out, capacity, gRegistry[i].vehicle->getType());
+        htmlCell(out, capacity, priorityName(gRegistry[i].vehicle->getPriority()));
+        appendText(out, capacity, "</tr>");
+    }
+    appendText(out, capacity, "</table>");
+    if (!gRegistryCount) appendText(out, capacity, "<p>No vehicles registered yet.</p>");
+}
+static void renderReservationTable(char* out, int capacity, bool withActions) {
+    appendText(out, capacity, "<h2>Reservations</h2><table border=\"1\" cellpadding=\"5\"><tr><th>ID</th><th>Vehicle</th><th>Owner</th><th>Block</th><th>Slot</th><th>Priority</th><th>Status</th>");
+    if (withActions) appendText(out, capacity, "<th>Action</th>");
+    appendText(out, capacity, "</tr>");
+    for (int i = 0; i < gManager->reservationCount(); ++i) {
+        const Reservation* r = gManager->reservationAt(i); if (!r) continue;
+        appendText(out, capacity, "<tr><td>%d</td>", r->getId());
+        htmlCell(out, capacity, r->getVehicleNo()); htmlCell(out, capacity, ownerFor(r->getVehicleNo()));
+        htmlCell(out, capacity, r->getBlockId()); appendText(out, capacity, "<td>%d</td>", r->getSlot());
+        htmlCell(out, capacity, priorityName(r->getPriority())); htmlCell(out, capacity, r->statusName());
+        if (withActions) {
+            appendText(out, capacity, "<td><form method=\"post\" action=\"/reservation-action\"><input type=\"hidden\" name=\"reservationId\" value=\"%d\"><button name=\"action\" value=\"cancel\">Cancel</button> <button name=\"action\" value=\"checkin\">Check In</button> <button name=\"action\" value=\"noshow\">No-Show</button> <label>Minutes late <input name=\"minutesLate\" type=\"number\" min=\"0\" value=\"0\"></label></form></td>", r->getId());
+        }
+        appendText(out, capacity, "</tr>");
+    }
+    appendText(out, capacity, "</table>");
+    if (!gManager->reservationCount()) appendText(out, capacity, "<p>No active reservations.</p>");
+}
+static void renderDashboard(char* out, int capacity) {
+    int total=0, freeSlots=0, reserved=0, occupied=0;
+    for (int i=0; i<gManager->getBlockCount(); ++i) {
+        ParkingBlock* b=gManager->getBlocks()[i]; total+=b->getCapacity();
+        freeSlots+=b->countByState(SLOT_FREE); reserved+=b->countByState(SLOT_RESERVED); occupied+=b->countByState(SLOT_OCCUPIED);
+    }
+    appendText(out,capacity,"<h2>Dashboard</h2><p><strong>Total slots:</strong> %d | <strong>Free:</strong> %d | <strong>Reserved:</strong> %d | <strong>Occupied:</strong> %d | <strong>Waiting:</strong> %d | <strong>Registered vehicles:</strong> %d</p>",total,freeSlots,reserved,occupied,gManager->waitlistSize(),gRegistryCount);
+    appendText(out,capacity,"<h2>Parking Blocks</h2><table border=\"1\" cellpadding=\"5\"><tr><th>Block</th><th>Capacity</th><th>Free</th><th>Reserved</th><th>Occupied</th></tr>");
+    for(int i=0;i<gManager->getBlockCount();++i){ ParkingBlock* b=gManager->getBlocks()[i]; appendText(out,capacity,"<tr>"); htmlCell(out,capacity,b->getId()); appendText(out,capacity,"<td>%d</td><td>%d</td><td>%d</td><td>%d</td></tr>",b->getCapacity(),b->countByState(SLOT_FREE),b->countByState(SLOT_RESERVED),b->countByState(SLOT_OCCUPIED)); }
+    appendText(out,capacity,"</table>");
+    for (int i = 0; i < gManager->getBlockCount(); ++i) {
+        ParkingBlock* block = gManager->getBlocks()[i];
+        if (block->usedCount() * 100 >= block->getCapacity() * 80) {
+            appendText(out, capacity, "<p><strong>CAPACITY ALERT:</strong> Block ");
+            htmlText(out, capacity, block->getId());
+            appendText(out, capacity, " is at least 80%% full.</p>");
+        }
+    }
+    renderReservationTable(out,capacity,false);
+}
+static void renderVehicles(char* out, int capacity) {
+    appendText(out,capacity,"<h2>Register Vehicle</h2><form method=\"post\" action=\"/register-vehicle\"><p>Vehicle number (max 15 characters): <input name=\"vehicleNumber\" maxlength=\"15\" required></p><p>Owner name: <input name=\"owner\" maxlength=\"59\" required></p><p>Vehicle type: <select name=\"type\"><option>Two Wheeler</option><option>Four Wheeler</option><option>Emergency</option></select></p><p>Category: <select name=\"category\"><option>Student</option><option>Faculty</option><option>Emergency</option></select></p><button type=\"submit\">Register Vehicle</button></form>");
+    renderVehicleTable(out,capacity);
+}
+static void renderReservations(char* out, int capacity) {
+    appendText(out,capacity,"<h2>Make Reservation</h2><p>Register the vehicle first on the Vehicles page.</p><form method=\"post\" action=\"/make-reservation\"><p>Vehicle number: <input name=\"vehicleNumber\" maxlength=\"15\" required></p><p>Preferred block: <select name=\"blockId\"><option>A</option><option>B</option><option>C</option></select></p><button type=\"submit\">Reserve Slot</button></form>");
+    appendText(out,capacity,"<h2>Undo</h2><form method=\"post\" action=\"/reservation-action\"><button name=\"action\" value=\"undo\">Undo Last Reservation</button></form>");
+    renderReservationTable(out,capacity,true);
+}
+static void renderWaitlist(char* out, int capacity) {
+    appendText(out,capacity,"<h2>Priority Waiting List</h2><p>Priority: Emergency first, then Faculty, then Student. FIFO order is maintained within each priority.</p><table border=\"1\" cellpadding=\"5\"><tr><th>Position</th><th>Vehicle</th><th>Requested Block</th><th>Priority</th></tr>");
+    for(int i=0;i<gManager->waitlistSize();++i){ WaitEntry e; if(!gManager->getWaitlistEntry(i,e)) continue; appendText(out,capacity,"<tr><td>%d</td>",i+1); htmlCell(out,capacity,e.vehicleNo); htmlCell(out,capacity,e.blockId); htmlCell(out,capacity,priorityName(e.priority)); appendText(out,capacity,"</tr>"); }
+    appendText(out,capacity,"</table>"); if(!gManager->waitlistSize()) appendText(out,capacity,"<p>The waiting list is empty.</p>");
+}
+static void renderNoShows(char* out, int capacity) {
+    appendText(out,capacity,"<h2>No-Show Register (BST Inorder)</h2><table border=\"1\" cellpadding=\"5\"><tr><th>Vehicle</th><th>No-Show Count</th><th>Record</th></tr>");
+    bool any=false; for(int i=0;;++i){char number[NAME_LEN];int count=0;if(!gNoShows.getEntryAt(i,number,NAME_LEN,count))break;any=true;appendText(out,capacity,"<tr>");htmlCell(out,capacity,number);appendText(out,capacity,"<td>%d</td>",count);htmlCell(out,capacity,count>=3?"Repeat offender":"Normal");appendText(out,capacity,"</tr>");}
+    appendText(out,capacity,"</table>"); if(!any) appendText(out,capacity,"<p>No no-show records yet.</p>");
+}
+static void renderReports(char* out, int capacity) {
+    int total=0,freeSlots=0,reserved=0,occupied=0; for(int i=0;i<gManager->getBlockCount();++i){ParkingBlock*b=gManager->getBlocks()[i];total+=b->getCapacity();freeSlots+=b->countByState(SLOT_FREE);reserved+=b->countByState(SLOT_RESERVED);occupied+=b->countByState(SLOT_OCCUPIED);}
+    appendText(out,capacity,"<h2>Occupancy Report</h2><p>Total: %d | Free: %d | Reserved: %d | Occupied: %d</p><p>Total fines collected: Rs %d | Fines issued: %d</p>",total,freeSlots,reserved,occupied,gFines.getTotalCollected(),gFines.getFinesIssued());
+    appendText(out,capacity,"<table border=\"1\" cellpadding=\"5\"><tr><th>Block</th><th>Capacity</th><th>Used</th><th>Free</th><th>Occupancy percent</th></tr>");
+    for(int i=0;i<gManager->getBlockCount();++i){ParkingBlock*b=gManager->getBlocks()[i];int pct=b->getCapacity()?b->usedCount()*100/b->getCapacity():0;appendText(out,capacity,"<tr>");htmlCell(out,capacity,b->getId());appendText(out,capacity,"<td>%d</td><td>%d</td><td>%d</td><td>%d%%</td></tr>",b->getCapacity(),b->usedCount(),b->countByState(SLOT_FREE),pct);} appendText(out,capacity,"</table>");
+}
+static void renderAI(char* out, int capacity) {
+    appendText(out,capacity,"<h2>Automatic Emergency Vehicle Allocation</h2><p>The C++ decision engine selects a reachable free block. It gives preference to shortest route, then more free spaces, then lower occupancy.</p><form method=\"post\" action=\"/emergency-allocate\"><p>Emergency vehicle number: <input name=\"vehicleNumber\" maxlength=\"15\" required></p><p>Owner / Department: <input name=\"owner\" maxlength=\"59\" required></p><p>Campus entry block: <select name=\"entryBlock\"><option>A</option><option>B</option><option>C</option></select></p><button type=\"submit\">Allocate Emergency Parking</button></form>");
+    if(gLastAI.made){appendText(out,capacity,"<h3>Last AI Decision</h3><p>Vehicle: ");htmlText(out,capacity,gLastAI.vehicleNumber);appendText(out,capacity," | Entry: ");htmlText(out,capacity,gLastAI.entryBlock);appendText(out,capacity," | Selected block: ");htmlText(out,capacity,gLastAI.selectedBlock);appendText(out,capacity," | Distance: %d edges | Free slots at decision: %d</p><p>Route: ",gLastAI.distance,gLastAI.freeSlots);for(int i=0;i<gLastAI.pathLength;++i){if(i)appendText(out,capacity," &rarr; ");htmlText(out,capacity,gManager->getBlocks()[gLastAI.path[i]]->getId());}appendText(out,capacity,"</p>");}
+    appendText(out,capacity,"<p><strong>AI type:</strong> Explainable rule-based decision engine (not a trained machine-learning model).</p>");
+}
+static void renderGraph(char* out, int capacity, const char* startBlock) {
+    appendText(out,capacity,"<h2>Campus Graph: Adjacency Matrix, BFS and DFS</h2><form method=\"get\" action=\"/graph\"><label>Start block: <select name=\"start\"><option>A</option><option>B</option><option>C</option></select></label> <button type=\"submit\">Show Traversals</button></form><h3>Adjacency Matrix</h3><table border=\"1\" cellpadding=\"5\"><tr><th>Block</th>");
+    for(int c=0;c<gManager->getBlockCount();++c){appendText(out,capacity,"<th>");htmlText(out,capacity,gManager->getBlocks()[c]->getId());appendText(out,capacity,"</th>");}appendText(out,capacity,"</tr>");
+    for(int r=0;r<gManager->getBlockCount();++r){appendText(out,capacity,"<tr><th>");htmlText(out,capacity,gManager->getBlocks()[r]->getId());appendText(out,capacity,"</th>");for(int c=0;c<gManager->getBlockCount();++c)appendText(out,capacity,"<td>%d</td>",gManager->adjacencyAt(r,c));appendText(out,capacity,"</tr>");}appendText(out,capacity,"</table>");
+    int bfs[MAX_BLOCKS],dfs[MAX_BLOCKS];int bc=gManager->bfsOrder(startBlock,bfs),dc=gManager->dfsOrder(startBlock,dfs);
+    appendText(out,capacity,"<h3>BFS starting from ");htmlText(out,capacity,startBlock);appendText(out,capacity,"</h3><p>");for(int i=0;i<bc;++i){if(i)appendText(out,capacity," &rarr; ");htmlText(out,capacity,gManager->getBlocks()[bfs[i]]->getId());}if(!bc)appendText(out,capacity,"Invalid start block");appendText(out,capacity,"</p><h3>DFS starting from ");htmlText(out,capacity,startBlock);appendText(out,capacity,"</h3><p>");for(int i=0;i<dc;++i){if(i)appendText(out,capacity," &rarr; ");htmlText(out,capacity,gManager->getBlocks()[dfs[i]]->getId());}if(!dc)appendText(out,capacity,"Invalid start block");appendText(out,capacity,"</p><p>Matrix stores connections; BFS and DFS visit the graph.</p>");
+}
+static void renderLogs(char* out, int capacity) {
+    appendText(out,capacity,"<h2>Activity Log</h2><form method=\"post\" action=\"/save-log\"><button type=\"submit\">Save Activity Log</button></form><ol>");
+    for(int i=0;i<gActivityLog.size();++i){appendText(out,capacity,"<li>");htmlText(out,capacity,gActivityLog.getAt(i));appendText(out,capacity,"</li>");}appendText(out,capacity,"</ol>");if(!gActivityLog.size())appendText(out,capacity,"<p>No activity recorded.</p>");
+}
+static void renderLab(char* out, int capacity) {
+    const int source[8]={42,8,19,3,27,11,6,31};int bubble[8],merge[8],heap[8],scratch[8];for(int i=0;i<8;++i)bubble[i]=merge[i]=heap[i]=source[i];bubbleSort(bubble,8);mergeSort(merge,scratch,0,7);heapSort(heap,8);
+    appendText(out,capacity,"<h2>DSA and OOP Demonstration Lab</h2><h3>Sorting (same sample values)</h3><p>Original: 42, 8, 19, 3, 27, 11, 6, 31</p>");
+    appendText(out,capacity,"<p>Bubble Sort: ");for(int i=0;i<8;++i)appendText(out,capacity,"%d%s",bubble[i],i==7?"":" , ");appendText(out,capacity,"</p><p>Merge Sort: ");for(int i=0;i<8;++i)appendText(out,capacity,"%d%s",merge[i],i==7?"":" , ");appendText(out,capacity,"</p><p>Heap Sort: ");for(int i=0;i<8;++i)appendText(out,capacity,"%d%s",heap[i],i==7?"":" , ");appendText(out,capacity,"</p>");
+    OOPNumber first(12),second(8);CampusCoordinator coordinator("Sample Campus Coordinator");appendText(out,capacity,"<p>Linear search for 19 in the original list returns index: %d</p><h3>OOP Demonstrations</h3><p>Operator + result (12 + 8): %d</p><p>Function returning objects result: %d</p><p>Operator - result (12 - 8): %d</p><p>Overloaded parking charge, default rate: Rs %d</p><p>Overloaded parking charge at Rs 30/hour: Rs %d</p><p>Hybrid inheritance role: ", linearSearch(source,8,19),(first+second).getValue(),addOOPObjects(first,second).getValue(),(first-second).getValue(),calculateCharge(75),calculateCharge(75,30));htmlText(out,capacity,coordinator.role());appendText(out,capacity,"</p><p>Other implemented concepts include classes, objects, constructors, destructors, copy constructors, templates, friend functions, virtual functions, abstract classes, inheritance, exception handling and file handling.</p><p><a href=\"/graph\">Open the adjacency matrix and graph traversal page</a>.</p>");
+}
+static void renderHtmlPage(char* out, int capacity, const char* page, const char* message, const char* graphStart) {
+    const char* title="Dashboard";if(strcmp(page,"vehicles")==0)title="Vehicles";else if(strcmp(page,"reservations")==0)title="Reservations";else if(strcmp(page,"waitlist")==0)title="Waiting List";else if(strcmp(page,"ai")==0)title="Emergency AI";else if(strcmp(page,"graph")==0)title="Graph BFS and DFS";else if(strcmp(page,"noshows")==0)title="No-Show Register";else if(strcmp(page,"reports")==0)title="Reports";else if(strcmp(page,"logs")==0)title="Activity Log";else if(strcmp(page,"lab")==0)title="DSA and OOP Lab";
+    htmlStart(out,capacity,title,message);
+    if(strcmp(page,"vehicles")==0)renderVehicles(out,capacity);else if(strcmp(page,"reservations")==0)renderReservations(out,capacity);else if(strcmp(page,"waitlist")==0)renderWaitlist(out,capacity);else if(strcmp(page,"ai")==0)renderAI(out,capacity);else if(strcmp(page,"graph")==0)renderGraph(out,capacity,graphStart&&graphStart[0]?graphStart:"A");else if(strcmp(page,"noshows")==0)renderNoShows(out,capacity);else if(strcmp(page,"reports")==0)renderReports(out,capacity);else if(strcmp(page,"logs")==0)renderLogs(out,capacity);else if(strcmp(page,"lab")==0)renderLab(out,capacity);else renderDashboard(out,capacity);
+    htmlEnd(out,capacity);
+}
+static void decodeFormPart(const char* input, int length, char* output, int outSize) {
+    int outputIndex = 0;
+
+    for (int i = 0; i < length && outputIndex < outSize - 1; ++i) {
+        if (input[i] == '+') {
+            output[outputIndex++] = ' ';
+        } else if (input[i] == '%' && i + 2 < length) {
+            char hex[3] = { input[i + 1], input[i + 2], '\0' };
+            output[outputIndex++] = (char)strtol(hex, 0, 16);
+            i += 2;
+        } else {
+            output[outputIndex++] = input[i];
+        }
+    }
+
+    output[outputIndex] = '\0';
 }
